@@ -1,0 +1,9 @@
+[package]
+name = "eye-spy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = "0.29.0"
+sdl2 = "0.37.0"
+v4l = "0.14.0"
