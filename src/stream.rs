@@ -1,23 +1,23 @@
 //! This module is responsible for configuring streams from and to the user.
 //! It provides basic frame encoding/decoding functionalities
 
-use sdl2::sys::Time;
+use openh264::decoder;
+use openh264::encoder::{EncodedBitStream, Encoder, EncoderRawAPI};
+use openh264::formats::{YUVBuffer, YUVSlices, YUVSource};
 use std::net::UdpSocket;
 use std::thread::spawn;
-use std::time::Duration;
-use v4l::{FourCC, FrameInterval};
+use v4l::FourCC;
 
 use v4l::buffer::Type;
 use v4l::io::traits::CaptureStream;
-use v4l::prelude::MmapStream;
+use v4l::prelude::{MmapStream, UserptrStream};
 use v4l::video::Capture;
 use v4l::{Device, Format};
 
-const WIDTH: u32 = 1920 / 8;
-const HEIGHT: u32 = 1080 / 8;
+const WIDTH: usize = 1920 / 8;
+const HEIGHT: usize = 1080 / 8;
 // Using YUV
 const FOURCC: FourCC = FourCC { repr: *b"YUYV" };
-const FRAMERATE: usize = 30;
 /// Packet identifier. Starts with 1
 type PacketIdentifier = u32;
 // and frame ends with 11 one's
@@ -58,7 +58,7 @@ impl FrameBuilder {
         dbg!(time, "Frame finished.");
     }
 
-    pub fn get_last_frame(&self) -> Option<&Box<[u8; 1024 * 512]>> {
+    pub fn get_last_frame(&self) -> Option<&[u8; 1024 * 512]> {
         let other_buffer = (self.selected_buffer + 1) % self.buffers.len();
         Some(&self.buffers[other_buffer])
     }
@@ -103,13 +103,101 @@ impl FrameBuilder {
         Err(())
     }
 }
+
+pub trait CustomStream<'a, T> {
+    fn next(&mut self) -> Option<&'_ [u8]>;
+}
+
+/// Wrapper implementing Stream for consistent interfaces
+
+struct H264YUVStream<'a> {
+    stream: MmapStream<'a>,
+    encoder: Encoder,
+    plane_buffers: [Vec<u8>; 3],
+}
+impl<'a> H264YUVStream<'a> {
+    const TEST: u32 = 2;
+    pub fn new(device: &Device) -> Self {
+        let stream = MmapStream::with_buffers(device, Type::VideoCapture, 4)
+            .expect("Failed to create buffer stream");
+
+        let encoder = openh264::encoder::Encoder::new().expect("Cannot create a h264 encoder.");
+        let plane_buffer_size = WIDTH * HEIGHT;
+        let plane_buffers = [
+            Vec::with_capacity(plane_buffer_size),
+            Vec::with_capacity(plane_buffer_size / 2),
+            Vec::with_capacity(plane_buffer_size / 2),
+        ];
+        Self {
+            stream,
+            encoder,
+            plane_buffers,
+        }
+    }
+    fn prepare_yuv_slices(&mut self, raw_buf: &[u8]) {
+        self.plane_buffers[0].clear(); // Y plane
+        self.plane_buffers[1].clear(); // U plane
+        self.plane_buffers[2].clear(); // V plane
+
+        // Process the raw YUYV data
+        for chunk in raw_buf.chunks(4) {
+            // YUYV format: Y1 U Y2 V
+            let y1 = chunk[0];
+            let u = chunk[1];
+            let y2 = chunk[2];
+            let v = chunk[3];
+
+            self.plane_buffers[0].push(y1);
+            self.plane_buffers[0].push(y2);
+
+            self.plane_buffers[1].push(u);
+            self.plane_buffers[2].push(v);
+        }
+    }
+
+    fn get_encoded_stream(&mut self) -> Result<EncodedBitStream, String> {
+        const STRIDES: (usize, usize, usize) = (WIDTH, WIDTH / 2, WIDTH / 2);
+
+        let raw_buf = {
+            let (raw_buf, _) = self.stream.next().map_err(|e| e.to_string())?;
+            raw_buf
+        };
+
+        self.prepare_yuv_slices(raw_buf);
+
+        let slices = YUVSlices::new(
+            (
+                &self.plane_buffers[0],
+                &self.plane_buffers[1],
+                &self.plane_buffers[2],
+            ),
+            (WIDTH, HEIGHT),
+            STRIDES,
+        );
+
+        let encoded = self.encoder.encode(&slices).map_err(|e| e.to_string())?;
+        Ok(encoded)
+    }
+}
+// H264YUVStream should be thread safe, as it gets data from the ether (/dev/video)
+unsafe impl<'a> Send for H264YUVStream<'a> {}
+unsafe impl<'a> Sync for H264YUVStream<'a> {}
+
+impl CustomStream<'_, MmapStream<'_>> for H264YUVStream<'_> {
+    fn next(&mut self) -> Option<&'_ [u8]> {
+        if let Ok(data) = self.stream.next() {
+            Some(data.0)
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn init_client_streams() {
     let dev = Device::new(0).or(Device::new(1)).unwrap();
-    let format = Format::new(WIDTH, HEIGHT, FOURCC);
+    let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
     dev.set_format(&format).unwrap();
-    let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4)
-        .expect("Failed to create buffer stream");
-
+    let mut stream = H264YUVStream::new(&dev);
     // Detach both threads
     spawn(move || {
         let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
@@ -124,15 +212,16 @@ pub(crate) fn init_client_streams() {
             }
         }
     });
+
     spawn(move || {
         let udp_transmitter = UdpSocket::bind("127.0.0.1:6969").unwrap();
         udp_transmitter.connect("127.0.0.1:7000").unwrap();
         // max safe udp packet is 508 bytes!!!
         // so: send 504 bytes and one int identifier
         loop {
-            let (data, meta) = stream.next().unwrap();
+            let data = stream.next().unwrap();
 
-            if data.is_empty() || meta.sequence % 2 == 0 {
+            if data.is_empty() {
                 continue;
             }
 
@@ -154,8 +243,6 @@ mod tests {
     const FRAME_PATH: &str = "frame.yuyv";
     use std::fs::File;
     use std::io::Read;
-
-    use crate::stream::PACKET_DATA_SIZE;
 
     use super::FrameBuilder;
 
