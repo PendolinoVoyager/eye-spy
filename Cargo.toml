@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nix = "0.29.0"
+lazy_static = "1.5.0"
 openh264 = "0.6.2"
 sdl2 = "0.37.0"
 v4l = "0.14.0"

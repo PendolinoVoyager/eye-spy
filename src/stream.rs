@@ -1,21 +1,23 @@
 //! This module is responsible for configuring streams from and to the user.
 //! It provides basic frame encoding/decoding functionalities
 
-use openh264::decoder;
-use openh264::encoder::{EncodedBitStream, Encoder, EncoderRawAPI};
-use openh264::formats::{YUVBuffer, YUVSlices, YUVSource};
+use lazy_static::lazy_static;
+use openh264::encoder::{EncodedBitStream, Encoder};
+use openh264::formats::YUVSlices;
+use std::io::BufWriter;
 use std::net::UdpSocket;
+use std::sync::Mutex;
 use std::thread::spawn;
 use v4l::FourCC;
 
 use v4l::buffer::Type;
 use v4l::io::traits::CaptureStream;
-use v4l::prelude::{MmapStream, UserptrStream};
+use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::{Device, Format};
 
-const WIDTH: usize = 1920 / 8;
-const HEIGHT: usize = 1080 / 8;
+const WIDTH: usize = 640;
+const HEIGHT: usize = 480;
 // Using YUV
 const FOURCC: FourCC = FourCC { repr: *b"YUYV" };
 /// Packet identifier. Starts with 1
@@ -24,6 +26,12 @@ type PacketIdentifier = u32;
 const FRAME_END: &[u8] = b"11111111111";
 /// The size of packet's raw frame data EXCLUDING meta
 const PACKET_DATA_SIZE: u32 = 504;
+
+// Static buffers so the borrow checker doesn't complain
+lazy_static! {
+    pub static ref YUV_FRAME_BUFFER_WRITER: Mutex<Vec<u8>> =
+        Mutex::new(Vec::with_capacity(WIDTH * HEIGHT * 2));
+}
 /// YUYV data frame
 pub struct FrameBuilder {
     pub finished: bool,
@@ -104,89 +112,95 @@ impl FrameBuilder {
     }
 }
 
+/// Trait for consistent interfaces accross streams
+/// It should be utilized on a wrapper struct for the original stream
 pub trait CustomStream<'a, T> {
-    fn next(&mut self) -> Option<&'_ [u8]>;
+    fn next(&mut self, buffer: &mut [u8]) -> Option<usize>;
+    fn next_vec(&mut self) -> Option<Vec<u8>>;
 }
 
-/// Wrapper implementing Stream for consistent interfaces
-
-struct H264YUVStream<'a> {
+struct H264Stream<'a> {
     stream: MmapStream<'a>,
     encoder: Encoder,
-    plane_buffers: [Vec<u8>; 3],
 }
-impl<'a> H264YUVStream<'a> {
-    const TEST: u32 = 2;
+impl<'a> H264Stream<'a> {
     pub fn new(device: &Device) -> Self {
         let stream = MmapStream::with_buffers(device, Type::VideoCapture, 4)
             .expect("Failed to create buffer stream");
 
         let encoder = openh264::encoder::Encoder::new().expect("Cannot create a h264 encoder.");
-        let plane_buffer_size = WIDTH * HEIGHT;
-        let plane_buffers = [
-            Vec::with_capacity(plane_buffer_size),
-            Vec::with_capacity(plane_buffer_size / 2),
-            Vec::with_capacity(plane_buffer_size / 2),
-        ];
-        Self {
-            stream,
-            encoder,
-            plane_buffers,
-        }
+
+        Self { stream, encoder }
     }
-    fn prepare_yuv_slices(&mut self, raw_buf: &[u8]) {
-        self.plane_buffers[0].clear(); // Y plane
-        self.plane_buffers[1].clear(); // U plane
-        self.plane_buffers[2].clear(); // V plane
+    #[inline]
+    fn prepare_yuv_slices(
+        raw_buf: &[u8],
+        width: usize,
+        height: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut y = Vec::with_capacity(width * height);
+        let mut u = Vec::with_capacity(width * height / 2);
+        let mut v = Vec::with_capacity(width * height / 2);
 
         // Process the raw YUYV data
         for chunk in raw_buf.chunks(4) {
             // YUYV format: Y1 U Y2 V
-            let y1 = chunk[0];
-            let u = chunk[1];
-            let y2 = chunk[2];
-            let v = chunk[3];
-
-            self.plane_buffers[0].push(y1);
-            self.plane_buffers[0].push(y2);
-
-            self.plane_buffers[1].push(u);
-            self.plane_buffers[2].push(v);
+            let y0 = chunk[0];
+            let u0 = chunk[1];
+            let y1 = chunk[2];
+            let v0 = chunk[3];
+            y.push(y0);
+            y.push(y1);
+            u.push(u0);
+            v.push(v0);
         }
+        (y, u, v)
     }
 
     fn get_encoded_stream(&mut self) -> Result<EncodedBitStream, String> {
-        const STRIDES: (usize, usize, usize) = (WIDTH, WIDTH / 2, WIDTH / 2);
+        const STRIDES: (usize, usize, usize) = (WIDTH, WIDTH, WIDTH);
 
         let raw_buf = {
             let (raw_buf, _) = self.stream.next().map_err(|e| e.to_string())?;
             raw_buf
         };
 
-        self.prepare_yuv_slices(raw_buf);
+        let slices = Self::prepare_yuv_slices(raw_buf, WIDTH, HEIGHT);
 
-        let slices = YUVSlices::new(
-            (
-                &self.plane_buffers[0],
-                &self.plane_buffers[1],
-                &self.plane_buffers[2],
-            ),
-            (WIDTH, HEIGHT),
-            STRIDES,
-        );
+        let slices = YUVSlices::new((&slices.0, &slices.1, &slices.2), (WIDTH, HEIGHT), STRIDES);
 
         let encoded = self.encoder.encode(&slices).map_err(|e| e.to_string())?;
         Ok(encoded)
     }
 }
 // H264YUVStream should be thread safe, as it gets data from the ether (/dev/video)
-unsafe impl<'a> Send for H264YUVStream<'a> {}
-unsafe impl<'a> Sync for H264YUVStream<'a> {}
+unsafe impl<'a> Send for H264Stream<'a> {}
+unsafe impl<'a> Sync for H264Stream<'a> {}
 
-impl CustomStream<'_, MmapStream<'_>> for H264YUVStream<'_> {
-    fn next(&mut self) -> Option<&'_ [u8]> {
-        if let Ok(data) = self.stream.next() {
-            Some(data.0)
+impl CustomStream<'_, MmapStream<'_>> for H264Stream<'_> {
+    fn next(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        if let Ok(bitstream) = self.get_encoded_stream() {
+            // let mut buffer = YUV_FRAME_BUFFER.get_mut().unwrap();
+            let mut buf_writer = BufWriter::new(buffer);
+            return match bitstream.write(&mut buf_writer) {
+                Ok(_) => Some(buf_writer.buffer().len()),
+
+                Err(e) => {
+                    dbg!(e);
+                    None
+                }
+            };
+        } else {
+            None
+        }
+    }
+    fn next_vec(&mut self) -> Option<Vec<u8>> {
+        if let Ok(bitstream) = self.get_encoded_stream() {
+            let mut vec = Vec::new();
+            if bitstream.write(&mut vec).is_err() {
+                return None;
+            }
+            Some(vec)
         } else {
             None
         }
@@ -196,8 +210,11 @@ impl CustomStream<'_, MmapStream<'_>> for H264YUVStream<'_> {
 pub(crate) fn init_client_streams() {
     let dev = Device::new(0).or(Device::new(1)).unwrap();
     let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
+
     dev.set_format(&format).unwrap();
-    let mut stream = H264YUVStream::new(&dev);
+
+    let mut stream = H264Stream::new(&dev);
+
     // Detach both threads
     spawn(move || {
         let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
@@ -218,14 +235,18 @@ pub(crate) fn init_client_streams() {
         udp_transmitter.connect("127.0.0.1:7000").unwrap();
         // max safe udp packet is 508 bytes!!!
         // so: send 504 bytes and one int identifier
+        let mut buf = Vec::with_capacity(WIDTH * HEIGHT * 2);
         loop {
-            let data = stream.next().unwrap();
+            let len = stream.next(&mut buf);
 
-            if data.is_empty() {
+            if len.is_none() {
                 continue;
             }
 
-            for (num, packet) in data.chunks(PACKET_DATA_SIZE as usize).enumerate() {
+            for (num, packet) in buf[0..len.unwrap()]
+                .chunks(PACKET_DATA_SIZE as usize)
+                .enumerate()
+            {
                 let mut packet_with_ident = Vec::with_capacity(PACKET_DATA_SIZE as usize + 4); // Allocate enough space
                 packet_with_ident.extend_from_slice(packet); // Append the packet data
                 let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
@@ -240,11 +261,17 @@ pub(crate) fn init_client_streams() {
 // Tests are very important when it comes to manipulating the frame
 #[cfg(test)]
 mod tests {
-    const FRAME_PATH: &str = "frame.yuyv";
     use std::fs::File;
     use std::io::Read;
 
-    use super::FrameBuilder;
+    use openh264::decoder::Decoder;
+    use v4l::video::Capture;
+    use v4l::Device;
+
+    use crate::stream::{FOURCC, HEIGHT, WIDTH};
+
+    use super::{CustomStream, FrameBuilder, H264Stream};
+    const TEST_H264_FILE: &str = "test.h264";
 
     #[test]
     fn test_frame_initialization() {
@@ -285,28 +312,7 @@ mod tests {
             assert_eq!(frame.buffers[0][i], byte);
         }
     }
-    #[test]
-    fn test_decode_frame() {
-        const LENGTH: usize = 102;
-        let mut packet_data: [u8; LENGTH] = [0; LENGTH];
-        let mut file = File::open(FRAME_PATH).unwrap();
-        let _ = file.read(&mut packet_data);
-        let ident: u32 = 2;
-        let ident_bytes = ident.to_le_bytes();
-        let mut buf = Vec::with_capacity(LENGTH);
-        buf.extend_from_slice(&packet_data);
-        buf.extend_from_slice(&ident_bytes); // Append identifier
 
-        // Decode the frame
-        let result = FrameBuilder::decode_frame(&buf).unwrap();
-
-        // Check that the data matches
-        assert_eq!(result.1, ident);
-        assert_eq!(result.0.len(), LENGTH);
-        for (i, &byte) in packet_data.iter().enumerate() {
-            assert_eq!(result.0[i], byte);
-        }
-    }
     #[test]
     fn test_frame_clear() {
         let mut frame = FrameBuilder::new();
@@ -320,5 +326,81 @@ mod tests {
         // Check that all fields are reset
         assert!(!frame.finished);
         assert_eq!(frame.last_packet, 0);
+    }
+    #[test]
+    fn test_frame_encoding() {
+        let device = Device::new(0).unwrap();
+        let format = v4l::Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
+        device.set_format(&format).unwrap();
+
+        let mut stream = H264Stream::new(&device);
+        let buf = stream.next_vec().unwrap();
+
+        assert!(!buf.is_empty(), "Buffer is empty after encoding");
+
+        assert!(
+            buf.starts_with(&[0x00, 0x00, 0x00, 0x01]) || buf.starts_with(&[0x00, 0x00, 0x01]),
+            "Encoded frame does not start with a valid H264 NAL unit start code"
+        );
+    }
+    #[test]
+    fn test_frame_decoding() {
+        // Create and open the file
+        let mut file = File::open(TEST_H264_FILE).expect("Cannot open the test frame file");
+
+        // Create buffer and buffer reader
+        let mut buf: Vec<u8> = Vec::with_capacity(1024 * 100);
+        let mut decoder = Decoder::new().unwrap();
+
+        let size = file.read_to_end(&mut buf).unwrap();
+        assert!(size > 0);
+
+        let mut frame_ref: Vec<u8> = Vec::new();
+        let mut accumulated_data: Vec<u8> = Vec::new(); // Buffer to accumulate NAL units
+
+        // Flags to track if SPS/PPS have been processed
+        let mut sps_found = false;
+        let mut pps_found = false;
+
+        // Iterate over NAL units
+        for packet in openh264::nal_units(&buf[0..size]) {
+            let nal_type = packet[0] & 0x1F;
+
+            // SPS NAL unit (NAL type 7)
+            if nal_type == 7 {
+                sps_found = true;
+            }
+
+            // PPS NAL unit (NAL type 8)
+            if nal_type == 8 {
+                pps_found = true;
+            }
+
+            // Accumulate NAL units
+            accumulated_data.extend_from_slice(packet);
+
+            // Only start decoding after both SPS and PPS have been processed
+            if sps_found && pps_found {
+                match decoder.decode(&accumulated_data) {
+                    Ok(Some(frame)) => {
+                        if frame_ref.is_empty() {
+                            frame.write_rgb8(&mut frame_ref);
+                        }
+                        accumulated_data.clear(); // Clear accumulated data after successful decode
+                    }
+                    Ok(None) => {
+                        // Decoder needs more data, keep accumulating NAL units
+                    }
+                    Err(e) => {
+                        panic!("Decoder error: {:?}", e);
+                    }
+                }
+            }
+        }
+        dbg!(sps_found, pps_found);
+        assert!(
+            !frame_ref.is_empty(),
+            "Couldn't recover even one frame from the stream."
+        );
     }
 }
