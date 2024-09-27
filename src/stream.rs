@@ -17,7 +17,6 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::{Device, Format};
-
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
 // Using YUV
@@ -47,6 +46,7 @@ pub struct NalBuilder {
     /// Identifier of the last packet. If the packet is lost, the NAL unit build is failed
     last_packet: PacketIdentifier,
     end_idx: usize,
+    last_idx: usize,
 }
 impl Default for NalBuilder {
     fn default() -> Self {
@@ -56,6 +56,7 @@ impl Default for NalBuilder {
             nal_unit_buffer: Box::new([0; 65535]),
             last_packet: 0,
             end_idx: 0,
+            last_idx: 0,
         }
     }
 }
@@ -76,6 +77,7 @@ impl NalBuilder {
         self.failed = false;
         self.last_packet = 0;
         self.end_idx = 0;
+        self.last_idx = 0;
     }
     /// Add data from the buffer. The more, the better
     pub fn add_data(&mut self, buf: &[u8]) {
@@ -95,9 +97,9 @@ impl NalBuilder {
             };
             self.last_packet = ident;
             // Copy the data into the buffer at correct slot
-            for (idx, byte) in data.iter().enumerate() {
-                self.nal_unit_buffer
-                    [((self.last_packet * PACKET_DATA_SIZE) + idx as u32) as usize] = *byte;
+            for byte in data.iter() {
+                self.nal_unit_buffer[self.last_idx] = *byte;
+                self.last_idx += 1;
             }
             self.end_idx += data.len();
         }
@@ -166,7 +168,6 @@ impl<'a> H264Stream<'a> {
         let buffer = self.stream.next().map_err(|e| e.to_string())?.0;
 
         let slices = Self::prepare_yuv_slices(buffer, WIDTH, HEIGHT);
-
         let slices = YUVSlices::new((&slices.0, &slices.1, &slices.2), (WIDTH, HEIGHT), STRIDES);
 
         let encoded = self.encoder.encode(&slices).map_err(|e| e.to_string())?;
@@ -218,32 +219,6 @@ pub(crate) fn init_client_streams() {
     let mut stream = H264Stream::new(&dev);
 
     // Detach both threads
-    spawn(move || {
-        let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
-        udp_receiver.connect("127.0.0.1:6969").unwrap();
-        let mut recv_buf: [u8; 1024] = [0; 1024];
-        // Don't do more than 60 fps
-        let mut nal_builder = NalBuilder::new();
-        let mut decoder = Decoder::new().unwrap();
-        loop {
-            while let Ok(bytes_read) = udp_receiver.recv(&mut recv_buf) {
-                nal_builder.add_data(&recv_buf[0..bytes_read]);
-                if nal_builder.finished && !nal_builder.failed {
-                    let unit = nal_builder.get_nal_unit();
-                    if unit.is_none() {
-                        continue;
-                    }
-                    dbg!("Got a nal unit!");
-
-                    match decoder.decode(unit.unwrap()) {
-                        Err(e) => (),
-                        Ok(Some(d)) => println!("GOT FRAME!!!!"),
-                        Ok(None) => println!("No frame..."),
-                    }
-                }
-            }
-        }
-    });
 
     spawn(move || {
         let udp_transmitter = UdpSocket::bind("127.0.0.1:6969").unwrap();
@@ -256,15 +231,43 @@ pub(crate) fn init_client_streams() {
             if buf.is_none() {
                 continue;
             }
-            for packet in nal_units(&buf.unwrap()) {
-                for (num, packet) in packet.chunks(PACKET_DATA_SIZE as usize).enumerate() {
+
+            for unit in nal_units(&buf.unwrap()) {
+                for (num, packet) in unit.chunks(PACKET_DATA_SIZE as usize).enumerate() {
                     let mut packet_with_ident = Vec::with_capacity(PACKET_DATA_SIZE as usize + 4); // Allocate enough space
                     packet_with_ident.extend_from_slice(packet); // Append the packet data
                     let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
                     packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
+
                     udp_transmitter.send(&packet_with_ident).unwrap();
                 }
                 udp_transmitter.send(FRAME_END).unwrap();
+            }
+        }
+    });
+    spawn(move || {
+        let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
+        udp_receiver.connect("127.0.0.1:6969").unwrap();
+        let mut recv_buf: [u8; 1024] = [0; 1024];
+        // Don't do more than 60 fps
+        let mut nal_builder = NalBuilder::new();
+
+        let mut decoder = Decoder::new().unwrap();
+        loop {
+            while let Ok(bytes_read) = udp_receiver.recv(&mut recv_buf) {
+                nal_builder.add_data(&recv_buf[0..bytes_read]);
+                if nal_builder.finished && !nal_builder.failed {
+                    let unit = nal_builder.get_nal_unit();
+                    if unit.is_none() {
+                        continue;
+                    }
+
+                    match decoder.decode(unit.unwrap()) {
+                        Err(e) => (),
+                        Ok(Some(d)) => println!("GOT FRAME!!!!"),
+                        Ok(None) => println!("No frame..."),
+                    }
+                }
             }
         }
     });
@@ -274,13 +277,13 @@ pub(crate) fn init_client_streams() {
 #[cfg(test)]
 mod tests {
 
-    use openh264::decoder::{Decoder, DecoderConfig};
+    use openh264::decoder::Decoder;
     use v4l::video::Capture;
     use v4l::Device;
 
     use crate::stream::{FOURCC, HEIGHT, WIDTH};
 
-    use super::{CustomStream, H264Stream, NalBuilder};
+    use super::{CustomStream, H264Stream};
     const TEST_H264_FILE: &str = "test.h264";
 
     #[test]
@@ -290,8 +293,7 @@ mod tests {
         device.set_format(&format).unwrap();
 
         let mut stream = H264Stream::new(&device);
-        let mut buf = Vec::with_capacity(WIDTH * HEIGHT);
-        stream.next(&mut buf);
+        let buf = stream.next_vec().unwrap();
 
         assert!(!buf.is_empty(), "Buffer is empty after encoding");
         assert!(
@@ -305,49 +307,31 @@ mod tests {
         let bytes = include_bytes!("../test.h264");
         let mut decoder = Decoder::new().unwrap();
 
-        let mut frame_ref: Vec<u8> = Vec::new();
+        let mut frame_ref: [u8; WIDTH * HEIGHT * 3] = [0; WIDTH * HEIGHT * 3];
         let mut accumulated_data: Vec<u8> = Vec::new(); // Buffer to accumulate NAL units
 
         // Flags to track if SPS/PPS have been processed
-        let mut sps_found = false;
-        let mut pps_found = false;
-
         // Iterate over NAL units
-        for packet in openh264::nal_units(bytes) {
-            let nal_type = packet[0] & 0x1F;
-
-            // SPS NAL unit (NAL type 7)
-            if nal_type == 7 {
-                sps_found = true;
-            }
-
-            // PPS NAL unit (NAL type 8)
-            if nal_type == 8 {
-                pps_found = true;
-            }
-
+        for unit in openh264::nal_units(bytes) {
             // Accumulate NAL units
-            accumulated_data.extend_from_slice(packet);
+            accumulated_data.extend_from_slice(unit);
 
             // Only start decoding after both SPS and PPS have been processed
-            if sps_found && pps_found {
-                match decoder.decode(&accumulated_data) {
-                    Ok(Some(frame)) => {
-                        if frame_ref.is_empty() {
-                            frame.write_rgb8(&mut frame_ref);
-                        }
-                        accumulated_data.clear(); // Clear accumulated data after successful decode
+            match decoder.decode(&accumulated_data) {
+                Ok(Some(frame)) => {
+                    if frame_ref.is_empty() {
+                        frame.write_rgb8(&mut frame_ref);
                     }
-                    Ok(None) => {
-                        // Decoder needs more data, keep accumulating NAL units
-                    }
-                    Err(e) => {
-                        panic!("Decoder error: {:?}", e);
-                    }
+                    accumulated_data.clear(); // Clear accumulated data after successful decode
+                }
+                Ok(None) => {
+                    dbg!("NONE");
+                }
+                Err(e) => {
+                    panic!("Decoder error: {:?}", e);
                 }
             }
         }
-        dbg!(sps_found, pps_found);
         assert!(
             !frame_ref.is_empty(),
             "Couldn't recover even one frame from the stream."
