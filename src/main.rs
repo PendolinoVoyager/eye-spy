@@ -7,7 +7,7 @@ use sdl2::render::WindowCanvas;
 use sdl2::sys::exit;
 use sdl2::EventPump;
 
-pub mod h264_stream;
+pub(crate) mod h264_stream;
 
 fn read_events(event_pump: &mut EventPump) {
     use sdl2::event::Event;
@@ -40,7 +40,6 @@ fn main() {
 
     let mut event_pump = sdl.event_pump().unwrap();
 
-    let mut i: u8 = 0;
     init_client_streams();
     let texture_creator = canvas.texture_creator();
 

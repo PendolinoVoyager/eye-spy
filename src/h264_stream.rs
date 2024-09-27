@@ -31,6 +31,7 @@ const PACKET_DATA_SIZE: u32 = 504;
 
 // Static buffers so the borrow checker doesn't complain
 lazy_static! {
+    // Only one frame, keep it light-weight and real-time
     pub static ref RGB_FRAME_BUFFER: Mutex<[u8; WIDTH * HEIGHT * 3]> =
         Mutex::new([0; WIDTH * HEIGHT * 3]);
 }
@@ -126,7 +127,7 @@ pub trait CustomStream<'a, T> {
     fn next_vec(&mut self) -> Option<Vec<u8>>;
 }
 
-struct H264Stream<'a> {
+pub struct H264Stream<'a> {
     stream: MmapStream<'a>,
     encoder: Encoder,
 }
@@ -140,6 +141,10 @@ impl<'a> H264Stream<'a> {
         Self { stream, encoder }
     }
     #[inline]
+    /// Allocates the buffers for the y u v slices and returns the data.\
+    /// # Performance
+    /// Compilator actually makes it faster than using statically allocated buffers, somehow...
+
     fn prepare_yuv_slices(
         raw_buf: &[u8],
         width: usize,
@@ -172,7 +177,6 @@ impl<'a> H264Stream<'a> {
         let slices = YUVSlices::new((&slices.0, &slices.1, &slices.2), (WIDTH, HEIGHT), STRIDES);
 
         let encoded = self.encoder.encode(&slices).map_err(|e| e.to_string())?;
-
         Ok(encoded)
     }
 }
@@ -231,10 +235,10 @@ pub(crate) fn init_client_streams() {
             if buf.is_none() {
                 continue;
             }
-
             for unit in nal_units(&buf.unwrap()) {
                 for (num, packet) in unit.chunks(PACKET_DATA_SIZE as usize).enumerate() {
-                    let mut packet_with_ident = Vec::with_capacity(PACKET_DATA_SIZE as usize + 4); // Allocate enough space
+                    // Again, this vector is nicely optimized by the compilator. No need for a buffer
+                    let mut packet_with_ident = Vec::with_capacity(PACKET_DATA_SIZE as usize + 4);
                     packet_with_ident.extend_from_slice(packet); // Append the packet data
                     let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
                     packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
