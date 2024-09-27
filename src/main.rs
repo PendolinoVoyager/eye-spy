@@ -1,12 +1,13 @@
 use std::time::Duration;
 
+use h264_stream::{init_client_streams, RGB_FRAME_BUFFER};
 use sdl2::pixels::Color;
+use sdl2::rect::Rect;
 use sdl2::render::WindowCanvas;
 use sdl2::sys::exit;
-use sdl2::{event, EventPump, Sdl};
-use stream::init_client_streams;
+use sdl2::EventPump;
 
-pub mod stream;
+pub mod h264_stream;
 
 fn read_events(event_pump: &mut EventPump) {
     use sdl2::event::Event;
@@ -41,12 +42,44 @@ fn main() {
 
     let mut i: u8 = 0;
     init_client_streams();
+    let texture_creator = canvas.texture_creator();
+
+    // Create a texture to store RGB data
+    let mut texture = texture_creator
+        .create_texture_streaming(
+            sdl2::pixels::PixelFormatEnum::RGB24,
+            h264_stream::WIDTH as u32,
+            h264_stream::HEIGHT as u32,
+        )
+        .unwrap();
+
     loop {
         read_events(&mut event_pump);
         canvas.set_draw_color(Color::RGB(0, 255, 255));
-        render(&mut canvas, Color::RGB(i, 64, 255 - i));
+        canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        canvas.clear();
+
+        texture
+            .update(
+                None,
+                &RGB_FRAME_BUFFER.lock().unwrap()[..],
+                h264_stream::WIDTH * 3,
+            )
+            .unwrap();
+        // Copy the texture to the canvas and render it
+        canvas
+            .copy(
+                &texture,
+                None,
+                Some(Rect::new(
+                    0,
+                    0,
+                    h264_stream::WIDTH as u32,
+                    h264_stream::HEIGHT as u32,
+                )),
+            )
+            .unwrap();
         canvas.present();
-        i = (i + 1) % 255;
         std::thread::sleep(Duration::from_micros(16700));
     }
 }

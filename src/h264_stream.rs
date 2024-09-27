@@ -1,5 +1,6 @@
-//! This module is responsible for configuring streams from and to the user.
-//! It provides basic frame encoding/decoding functionalities
+//! This module is responsible for configuring, encoding, decoding  H264 streams from and to the user.
+//! It provides basic controls via <!TODO!>
+//! To get a received frame
 
 use lazy_static::lazy_static;
 use openh264::decoder::Decoder;
@@ -17,8 +18,8 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::{Device, Format};
-const WIDTH: usize = 640;
-const HEIGHT: usize = 480;
+pub const WIDTH: usize = 640;
+pub const HEIGHT: usize = 480;
 // Using YUV
 const FOURCC: FourCC = FourCC { repr: *b"YUYV" };
 /// Packet identifier. Starts with 1
@@ -30,8 +31,8 @@ const PACKET_DATA_SIZE: u32 = 504;
 
 // Static buffers so the borrow checker doesn't complain
 lazy_static! {
-    pub static ref YUV_FRAME_BUFFER: Mutex<Vec<u8>> =
-        Mutex::new(Vec::with_capacity(WIDTH * HEIGHT * 2 * 30));
+    pub static ref RGB_FRAME_BUFFER: Mutex<[u8; WIDTH * HEIGHT * 3]> =
+        Mutex::new([0; WIDTH * HEIGHT * 3]);
 }
 
 /// NAL unit builder for a H.264 stream over UDP.
@@ -213,7 +214,6 @@ impl CustomStream<'_, MmapStream<'_>> for H264Stream<'_> {
 pub(crate) fn init_client_streams() {
     let dev = Device::new(0).or(Device::new(1)).unwrap();
     let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
-
     dev.set_format(&format).unwrap();
 
     let mut stream = H264Stream::new(&dev);
@@ -264,7 +264,9 @@ pub(crate) fn init_client_streams() {
 
                     match decoder.decode(unit.unwrap()) {
                         Err(e) => (),
-                        Ok(Some(d)) => println!("GOT FRAME!!!!"),
+                        Ok(Some(d)) => d.write_rgb8(
+                            &mut RGB_FRAME_BUFFER.lock().unwrap()[0..(WIDTH * HEIGHT * 3)],
+                        ),
                         Ok(None) => println!("No frame..."),
                     }
                 }
@@ -281,7 +283,7 @@ mod tests {
     use v4l::video::Capture;
     use v4l::Device;
 
-    use crate::stream::{FOURCC, HEIGHT, WIDTH};
+    use crate::h264_stream::{FOURCC, HEIGHT, WIDTH};
 
     use super::{CustomStream, H264Stream};
     const TEST_H264_FILE: &str = "test.h264";
