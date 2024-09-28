@@ -1,6 +1,6 @@
 //! This module is responsible for configuring, encoding, decoding  H264 streams from and to the user.
 //! It provides basic controls via <!TODO!>
-//! To get a received frame
+//! To get a received frame. It works outside any renderer.
 
 use lazy_static::lazy_static;
 use openh264::decoder::Decoder;
@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Duration;
 use stream_control::{
-    H264StreamControls, StreamState, SSIGNAL_CONNECT, SSIGNAL_DISCONNECT, SSIGNAL_NONE,
-    SSIGNAL_PAUSE, SSIGNAL_RESUME, SSIGNAL_TERMINATE,
+    H264StreamControls, SSIGNAL_CONNECT, SSIGNAL_DISCONNECT, SSIGNAL_NONE, SSIGNAL_PAUSE,
+    SSIGNAL_RESUME, SSIGNAL_TERMINATE,
 };
 use v4l::FourCC;
 
@@ -38,8 +38,8 @@ const PACKET_DATA_SIZE: u32 = 504;
 // Static buffers so the borrow checker doesn't complain
 lazy_static! {
     // Only one frame, keep it light-weight and real-time
-    pub static ref RGB_FRAME_BUFFER: Mutex<[u8; WIDTH * HEIGHT * 3]> =
-        Mutex::new([0; WIDTH * HEIGHT * 3]);
+    pub static ref RGB_FRAME_BUFFER: Mutex<[u8; WIDTH * HEIGHT * 4]> =
+        Mutex::new([0; WIDTH * HEIGHT * 4]);
 }
 
 /// NAL unit builder for a H.264 stream over UDP.
@@ -244,11 +244,6 @@ pub(crate) mod stream_control {
     /// Stream Signal Terminate - signal stream thread to exit loop and terminate  
     pub(crate) const SSIGNAL_TERMINATE: u8 = 1 << 5;
 
-    pub(crate) enum StreamState {
-        Disconnected,
-        Paused,
-        Running,
-    }
     pub trait StreamControls {
         /// Connect to an address to send data to from given port
         /// After connecting the stream will be in paused state.
@@ -327,6 +322,7 @@ pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
         let mut stream = H264Stream::new(&dev);
         let socket = UdpSocket::bind("127.0.0.1:6969").unwrap();
         let mut streaming = false;
+        let mut addr_bound = false;
         loop {
             // Read the atomic signal frequently
             let op_performed = match signal_clone.load(std::sync::atomic::Ordering::SeqCst) {
@@ -338,6 +334,7 @@ pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
                 }
                 SSIGNAL_DISCONNECT => {
                     streaming = false;
+                    addr_bound = false;
                     println!("DISCONNECT");
                     true
                 }
@@ -351,6 +348,7 @@ pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
                         println!("{:?}", addr);
                     }
                     streaming = true;
+                    addr_bound = true;
                     true
                 }
                 SSIGNAL_RESUME => {
@@ -365,7 +363,7 @@ pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
                 signal_clone.store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
             }
 
-            if streaming {
+            if streaming && addr_bound {
                 let buf = stream.next_vec();
 
                 if buf.is_none() {
@@ -395,11 +393,8 @@ pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
     Ok(controls)
 }
 
-pub(crate) fn init_client_streams() {
-    let dev = Device::new(0).or(Device::new(1)).unwrap();
-    let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
-    dev.set_format(&format).unwrap();
-
+/// Start a debug listener on port 7000 UDP that decodes NAL packets and writes to RGB_FRAME_BUFFEr
+pub(crate) fn start_debug_listener() {
     // Debug listener thread to display stream
     spawn(move || {
         let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
@@ -419,9 +414,9 @@ pub(crate) fn init_client_streams() {
                     }
 
                     match decoder.decode(unit.unwrap()) {
-                        Err(e) => (),
-                        Ok(Some(d)) => d.write_rgb8(
-                            &mut RGB_FRAME_BUFFER.lock().unwrap()[0..(WIDTH * HEIGHT * 3)],
+                        Err(_) => (),
+                        Ok(Some(d)) => d.write_rgba8(
+                            &mut RGB_FRAME_BUFFER.lock().unwrap()[0..(WIDTH * HEIGHT * 4)],
                         ),
                         Ok(None) => println!("No frame..."),
                     }
@@ -464,7 +459,7 @@ mod tests {
         let bytes = include_bytes!("../test.h264");
         let mut decoder = Decoder::new().unwrap();
 
-        let mut frame_ref: [u8; WIDTH * HEIGHT * 3] = [0; WIDTH * HEIGHT * 3];
+        let mut frame_ref: [u8; WIDTH * HEIGHT * 4] = [0; WIDTH * HEIGHT * 4];
         let mut accumulated_data: Vec<u8> = Vec::new(); // Buffer to accumulate NAL units
 
         // Flags to track if SPS/PPS have been processed
@@ -477,7 +472,7 @@ mod tests {
             match decoder.decode(&accumulated_data) {
                 Ok(Some(frame)) => {
                     if frame_ref.is_empty() {
-                        frame.write_rgb8(&mut frame_ref);
+                        frame.write_rgba8(&mut frame_ref);
                     }
                     accumulated_data.clear(); // Clear accumulated data after successful decode
                 }
