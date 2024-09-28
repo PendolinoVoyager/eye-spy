@@ -1,6 +1,9 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use h264_stream::{init_client_streams, RGB_FRAME_BUFFER};
+use h264_stream::stream_control::{H264StreamControls, StreamControls};
+use h264_stream::{init_client_streams, init_h264_video_stream, RGB_FRAME_BUFFER};
+use sdl2::keyboard::Keycode;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::render::WindowCanvas;
@@ -9,11 +12,21 @@ use sdl2::EventPump;
 
 pub(crate) mod h264_stream;
 
-fn read_events(event_pump: &mut EventPump) {
+fn read_events(event_pump: &mut EventPump, stream_controls: &mut H264StreamControls) {
     use sdl2::event::Event;
     for event in event_pump.poll_iter() {
         match event {
             Event::Quit { .. } => unsafe { exit(0) },
+            Event::KeyDown { keycode, .. } => match keycode {
+                Some(Keycode::D) => stream_controls.disconnect(),
+                Some(Keycode::C) => {
+                    stream_controls.connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000))
+                }
+                Some(Keycode::P) => stream_controls.pause(),
+                Some(Keycode::U) => stream_controls.unpause(),
+
+                _ => (),
+            },
             _ => (),
         }
         continue;
@@ -41,6 +54,8 @@ fn main() {
     let mut event_pump = sdl.event_pump().unwrap();
 
     init_client_streams();
+    let mut video_stream_controls = init_h264_video_stream().unwrap();
+
     let texture_creator = canvas.texture_creator();
 
     // Create a texture to store RGB data
@@ -53,7 +68,7 @@ fn main() {
         .unwrap();
 
     loop {
-        read_events(&mut event_pump);
+        read_events(&mut event_pump, &mut video_stream_controls);
         canvas.set_draw_color(Color::RGB(0, 255, 255));
         canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         canvas.clear();

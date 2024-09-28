@@ -8,9 +8,15 @@ use openh264::encoder::{EncodedBitStream, Encoder};
 use openh264::formats::YUVSlices;
 use openh264::nal_units;
 use std::io::BufWriter;
-use std::net::UdpSocket;
-use std::sync::Mutex;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex};
 use std::thread::spawn;
+use std::time::Duration;
+use stream_control::{
+    H264StreamControls, StreamState, SSIGNAL_CONNECT, SSIGNAL_DISCONNECT, SSIGNAL_NONE,
+    SSIGNAL_PAUSE, SSIGNAL_RESUME, SSIGNAL_TERMINATE,
+};
 use v4l::FourCC;
 
 use v4l::buffer::Type;
@@ -144,7 +150,6 @@ impl<'a> H264Stream<'a> {
     /// Allocates the buffers for the y u v slices and returns the data.\
     /// # Performance
     /// Compilator actually makes it faster than using statically allocated buffers, somehow...
-
     fn prepare_yuv_slices(
         raw_buf: &[u8],
         width: usize,
@@ -177,12 +182,12 @@ impl<'a> H264Stream<'a> {
         let slices = YUVSlices::new((&slices.0, &slices.1, &slices.2), (WIDTH, HEIGHT), STRIDES);
 
         let encoded = self.encoder.encode(&slices).map_err(|e| e.to_string())?;
+
         Ok(encoded)
     }
 }
 // H264YUVStream should be thread safe, as it gets data from the ether (/dev/video)
 unsafe impl<'a> Send for H264Stream<'a> {}
-unsafe impl<'a> Sync for H264Stream<'a> {}
 
 impl CustomStream<'_, MmapStream<'_>> for H264Stream<'_> {
     fn next(&mut self, buffer: &mut [u8]) -> Option<usize> {
@@ -215,40 +220,187 @@ impl CustomStream<'_, MmapStream<'_>> for H264Stream<'_> {
     }
 }
 
+/// Signals passed to the stream thread. The thread will read them the next time the stream loop will run, before any action
+/// It will cause delay, but it's easier this way,
+/// After reading the signal, it will be set back to SignalNone,
+pub(crate) mod stream_control {
+
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    /// Stream Signal None - no signal to stream thread
+    pub(crate) const SSIGNAL_NONE: u8 = 0;
+    /// Stream Signal Disconnect - signal stream to stop until another connection
+    pub(crate) const SSIGNAL_DISCONNECT: u8 = 1 << 1;
+    /// Stream Signal Pause - signal stream thread to pause
+    pub(crate) const SSIGNAL_PAUSE: u8 = 1 << 2;
+    /// Stream Signal Resume - signal stream thread to resume/start  
+    pub(crate) const SSIGNAL_RESUME: u8 = 1 << 3;
+    /// Stream Signal Resume - signal stream thread to resume/start
+    /// Loads the SocketAddr from the mutex inside StreamControls.data  
+    pub(crate) const SSIGNAL_CONNECT: u8 = 1 << 4;
+    /// Stream Signal Terminate - signal stream thread to exit loop and terminate  
+    pub(crate) const SSIGNAL_TERMINATE: u8 = 1 << 5;
+
+    pub(crate) enum StreamState {
+        Disconnected,
+        Paused,
+        Running,
+    }
+    pub trait StreamControls {
+        /// Connect to an address to send data to from given port
+        /// After connecting the stream will be in paused state.
+        fn connect(&mut self, addr: SocketAddr);
+        /// Disconnect and terminate the stream thread.
+        fn disconnect(&mut self);
+        /// Pause the stream if connected, with ability to unpause later
+        fn pause(&mut self);
+        /// Unpause the stream after pausing, or start if just connected
+        fn unpause(&mut self);
+    }
+
+    pub struct H264StreamControls {
+        t_handle: JoinHandle<()>,
+        /// Atomic for frequent reads
+        signal: Arc<AtomicU8>,
+        /// Mutex for storing SocketAddr once
+        signal_data: Arc<Mutex<SocketAddr>>,
+    }
+    impl H264StreamControls {
+        pub fn new(
+            t: JoinHandle<()>,
+            signal: Arc<AtomicU8>,
+            signal_data: Arc<Mutex<SocketAddr>>,
+        ) -> Self {
+            Self {
+                t_handle: t,
+                signal,
+                signal_data,
+            }
+        }
+    }
+    impl StreamControls for H264StreamControls {
+        fn connect(&mut self, addr: SocketAddr) {
+            let mut data_guard = self.signal_data.try_lock().unwrap();
+
+            *data_guard = addr;
+            self.signal.store(SSIGNAL_CONNECT, Ordering::SeqCst);
+        }
+
+        fn disconnect(&mut self) {
+            self.signal.store(SSIGNAL_DISCONNECT, Ordering::SeqCst);
+        }
+
+        fn pause(&mut self) {
+            self.signal.store(SSIGNAL_PAUSE, Ordering::SeqCst);
+        }
+
+        fn unpause(&mut self) {
+            self.signal.store(SSIGNAL_RESUME, Ordering::SeqCst);
+        }
+    }
+    impl Drop for H264StreamControls {
+        fn drop(&mut self) {
+            self.signal.store(SSIGNAL_TERMINATE, Ordering::SeqCst);
+        }
+    }
+}
+/// Init the video stream. Returns controls to the stream, or Error
+pub(crate) fn init_h264_video_stream() -> Result<H264StreamControls, ()> {
+    let signal = Arc::new(AtomicU8::new(stream_control::SSIGNAL_NONE));
+    let addr = Arc::new(Mutex::new(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        6969,
+    )))); // Protect the address with a Mutex
+
+    // Clone Arc to be used in the thread
+    let signal_clone = Arc::clone(&signal);
+    let addr_clone = Arc::clone(&addr);
+    // Spawn a thread to control the stream
+    let t = std::thread::spawn(move || {
+        let dev = Device::new(0).or(Device::new(1)).unwrap();
+        let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
+        dev.set_format(&format).unwrap();
+
+        let mut stream = H264Stream::new(&dev);
+        let socket = UdpSocket::bind("127.0.0.1:6969").unwrap();
+        let mut streaming = false;
+        loop {
+            // Read the atomic signal frequently
+            let op_performed = match signal_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                SSIGNAL_PAUSE => {
+                    streaming = false;
+
+                    println!("PAUSE");
+                    true
+                }
+                SSIGNAL_DISCONNECT => {
+                    streaming = false;
+                    println!("DISCONNECT");
+                    true
+                }
+                SSIGNAL_TERMINATE => {
+                    break;
+                }
+                SSIGNAL_CONNECT => {
+                    println!("CONNECT");
+                    if let Ok(addr) = addr_clone.lock() {
+                        socket.connect(addr.to_string()).unwrap();
+                        println!("{:?}", addr);
+                    }
+                    streaming = true;
+                    true
+                }
+                SSIGNAL_RESUME => {
+                    println!("RESUME");
+                    streaming = true;
+                    true
+                }
+                _ => false,
+            };
+            // Reset signal right after
+            if op_performed {
+                signal_clone.store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            if streaming {
+                let buf = stream.next_vec();
+
+                if buf.is_none() {
+                    continue;
+                }
+                for unit in nal_units(&buf.unwrap()) {
+                    for (num, packet) in unit.chunks(PACKET_DATA_SIZE as usize).enumerate() {
+                        // Again, this vector is nicely optimized by the compilator. No need for a buffer
+                        let mut packet_with_ident =
+                            Vec::with_capacity(PACKET_DATA_SIZE as usize + 4);
+                        packet_with_ident.extend_from_slice(packet); // Append the packet data
+                        let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
+                        packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
+
+                        socket.send(&packet_with_ident).unwrap();
+                    }
+                    socket.send(FRAME_END).unwrap();
+                }
+            }
+
+            // Sleep to simulate periodic signal checking
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+
+    let controls = H264StreamControls::new(t, signal, addr);
+    Ok(controls)
+}
+
 pub(crate) fn init_client_streams() {
     let dev = Device::new(0).or(Device::new(1)).unwrap();
     let format = Format::new(WIDTH as u32, HEIGHT as u32, FOURCC);
     dev.set_format(&format).unwrap();
 
-    let mut stream = H264Stream::new(&dev);
-
-    // Detach both threads
-
-    spawn(move || {
-        let udp_transmitter = UdpSocket::bind("127.0.0.1:6969").unwrap();
-        udp_transmitter.connect("127.0.0.1:7000").unwrap();
-        // Sending NAL packets, which can be lost
-        // let mut buf = Vec::with_capacity(WIDTH * HEIGHT * 2);
-        loop {
-            let buf = stream.next_vec();
-
-            if buf.is_none() {
-                continue;
-            }
-            for unit in nal_units(&buf.unwrap()) {
-                for (num, packet) in unit.chunks(PACKET_DATA_SIZE as usize).enumerate() {
-                    // Again, this vector is nicely optimized by the compilator. No need for a buffer
-                    let mut packet_with_ident = Vec::with_capacity(PACKET_DATA_SIZE as usize + 4);
-                    packet_with_ident.extend_from_slice(packet); // Append the packet data
-                    let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
-                    packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
-
-                    udp_transmitter.send(&packet_with_ident).unwrap();
-                }
-                udp_transmitter.send(FRAME_END).unwrap();
-            }
-        }
-    });
+    // Debug listener thread to display stream
     spawn(move || {
         let udp_receiver = UdpSocket::bind("127.0.0.1:7000").unwrap();
         udp_receiver.connect("127.0.0.1:6969").unwrap();
@@ -290,7 +442,6 @@ mod tests {
     use crate::h264_stream::{FOURCC, HEIGHT, WIDTH};
 
     use super::{CustomStream, H264Stream};
-    const TEST_H264_FILE: &str = "test.h264";
 
     #[test]
     fn test_frame_encoding() {
