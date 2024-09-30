@@ -7,11 +7,9 @@ use bevy::prelude::*;
 use bevy_tweening::lens::UiBackgroundColorLens;
 use bevy_tweening::{Animator, EaseFunction, Tween};
 
-use crate::ui_logic::HostButton;
+use crate::ui_logic::{ButtonRole, ButtonWithRole, HostButton};
+use crate::STREAM_IMAGE_HANDLE;
 
-// Generic component marking the role of a button
-#[derive(Component, Deref, DerefMut, PartialEq, Eq)]
-pub struct ButtonMarker(pub u16);
 #[allow(unused)]
 pub mod color_palette {
     use bevy::color::palettes::tailwind::VIOLET_200;
@@ -270,7 +268,7 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
             border_color: BorderColor(color_palette::BLACK),
             ..Default::default()
         })
-        .insert(UiImage::new(crate::RGBA_IMAGE_HANDLE).with_flip_x())
+        .insert(UiImage::new(STREAM_IMAGE_HANDLE).with_flip_x())
         .id();
     let mut root = commands.spawn(root);
     let mut containers = UiContainers {
@@ -278,7 +276,6 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
         stream_window,
         host_bar: Entity::from_raw(0),
     };
-
     root.with_children(|p| {
         let mut side_bar = p.spawn(side_bar);
         containers.host_bar = side_bar.id();
@@ -286,7 +283,11 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
         btn.insert(HostButton(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         side_bar.add_child(btn.id());
         let mut right_bar = p.spawn(right_side_box);
+
+        let mut btn_disconnect = spawner.spawn_pretty_button_with_text("Disconnect", 32.);
+        btn_disconnect.insert(ButtonWithRole(ButtonRole::Disconnect));
         right_bar.add_child(stream_window);
+        right_bar.add_child(btn_disconnect.id());
     });
     commands.insert_resource(containers);
 }

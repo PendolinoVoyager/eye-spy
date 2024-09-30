@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
-bevy = { version = "0.14.2", features = ["dynamic_linking"] }
 bevy_tweening = "0.11.0"
 lazy_static = "1.5.0"
 openh264 = {version = "0.6.2", features=["libloading", "source"]} 
@@ -20,3 +19,25 @@ opt-level = 3
 
 [toolchain]
 channel = "nightly"
+
+[dependencies.bevy]
+version = "^0.14.2"
+# Disable the default features if there are any that you do not want
+default-features = false
+features = [
+    "bevy_asset",
+    "bevy_audio",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_render",
+    "bevy_state",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "x11",
+    "dynamic_linking",
+    "file_watcher",
+    "wayland"
+]

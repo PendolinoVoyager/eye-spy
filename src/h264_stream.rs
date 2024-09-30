@@ -151,7 +151,7 @@ impl CustomStream<'_, MmapStream<'_>> for H264Stream<'_> {
 /// After reading the signal, it will be set back to SignalNone,
 pub(crate) mod outgoing {
 
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::net::{SocketAddr, UdpSocket};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -224,7 +224,16 @@ pub(crate) mod outgoing {
             self.signal.store(SSIGNAL_TERMINATE, Ordering::SeqCst);
         }
     }
+    /// Inits a new stream, including opening the video device.
 
+    fn init_inner_stream<'a>() -> (H264Stream<'a>, Device) {
+        let dev = Device::new(0).or(Device::new(1)).unwrap();
+        let format = Format::new(super::WIDTH as u32, super::HEIGHT as u32, super::FOURCC);
+        dev.set_format(&format).unwrap();
+
+        let stream = H264Stream::new(&dev);
+        (stream, dev)
+    }
     /// Init the video stream. Returns controls to the stream, or Error
     /// The socket will be created at given address
     pub(crate) fn init_h264_video_stream(addr: SocketAddr) -> Result<H264StreamControls, ()> {
@@ -235,85 +244,98 @@ pub(crate) mod outgoing {
         // Clone Arc to be used in the thread
         let signal_clone = Arc::clone(&signal);
         let signal_data_clone = Arc::clone(&signal_data);
+
         // Spawn a thread to control the stream
         let t = std::thread::spawn(move || {
-            let dev = Device::new(0).or(Device::new(1)).unwrap();
-            let format = Format::new(super::WIDTH as u32, super::HEIGHT as u32, super::FOURCC);
-            dev.set_format(&format).unwrap();
-
-            let mut stream = H264Stream::new(&dev);
+            let mut stream: Option<H264Stream> = None;
+            let mut dev: Option<Device> = None;
             let socket = UdpSocket::bind("127.0.0.1:6969").unwrap();
+            socket.set_nonblocking(true).unwrap();
             let mut streaming = false;
             let mut addr_bound = false;
+
             loop {
                 // Read the atomic signal frequently
                 let op_performed = match signal_clone.load(std::sync::atomic::Ordering::SeqCst) {
                     SSIGNAL_PAUSE => {
                         streaming = false;
-
-                        println!("PAUSE");
                         true
                     }
                     SSIGNAL_DISCONNECT => {
                         streaming = false;
                         addr_bound = false;
-                        println!("DISCONNECT");
+
+                        // Drop the stream first, then device that the stream is uging
+                        stream.take();
+                        dev.take();
+
                         true
                     }
                     SSIGNAL_TERMINATE => {
+                        stream.take();
+                        dev.take();
                         break;
                     }
                     SSIGNAL_CONNECT => {
-                        match signal_data_clone.lock() {
-                            Ok(addr) => {
-                                socket.connect(addr.to_string()).unwrap();
-                                println!("{:?}", addr.to_string());
+                        // Re-initialize the stream and device on connect
+                        if let Ok(addr) = signal_data_clone.lock() {
+                            socket.connect(addr.to_string()).unwrap();
+                            streaming = true;
+                            addr_bound = true;
+
+                            // Initialize the stream and device only if they are not already running
+                            if stream.is_none() || dev.is_none() {
+                                let (new_stream, new_dev) = init_inner_stream();
+                                stream = Some(new_stream);
+                                dev = Some(new_dev);
                             }
-                            Err(e) => {
-                                println!("{}", e);
+
+                            // Force an intra-frame on the encoder
+                            if let Some(ref mut stream_ref) = stream {
+                                stream_ref.encoder.force_intra_frame();
                             }
+                            true
+                        } else {
+                            false
                         }
-                        streaming = true;
-                        addr_bound = true;
-                        stream.encoder.force_intra_frame();
-                        true
                     }
                     SSIGNAL_RESUME => {
-                        println!("RESUME");
                         streaming = true;
                         true
                     }
                     _ => false,
                 };
-                // Reset signal right after
+
+                // Reset the signal to not duplicate operations
                 if op_performed {
                     signal_clone.store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
                 }
 
-                if streaming && addr_bound {
-                    let buf = stream.next_vec();
+                if !streaming || !addr_bound {
+                    std::thread::sleep(Duration::from_millis(30));
 
-                    if buf.is_none() {
-                        continue;
-                    }
-                    for unit in nal_units(&buf.unwrap()) {
-                        for (num, packet) in
-                            unit.chunks(super::PACKET_DATA_SIZE as usize).enumerate()
-                        {
-                            // Again, this vector is nicely optimized by the compilator. No need for a buffer
-                            let mut packet_with_ident =
-                                Vec::with_capacity(super::PACKET_DATA_SIZE as usize + 4);
-                            packet_with_ident.extend_from_slice(packet); // Append the packet data
-                            let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
-                            packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
-
-                            let _ = socket.send(&packet_with_ident);
-                        }
-                        let _ = socket.send(super::FRAME_END);
-                    }
+                    continue;
                 }
 
-                // Sleep to simulate periodic signal checking
+                if let Some(ref mut stream_ref) = stream {
+                    if let Some(buf) = stream_ref.next_vec() {
+                        for unit in nal_units(&buf) {
+                            for (num, packet) in
+                                unit.chunks(super::PACKET_DATA_SIZE as usize).enumerate()
+                            {
+                                // This vector is nicely optimized by the compiler. No need for a buffer
+                                let mut packet_with_ident =
+                                    Vec::with_capacity(super::PACKET_DATA_SIZE as usize + 4);
+                                packet_with_ident.extend_from_slice(packet); // Append the packet data
+                                let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
+                                packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
+
+                                let _ = socket.send(&packet_with_ident);
+                            }
+                            let _ = socket.send(super::FRAME_END);
+                        }
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(30));
             }
         });
@@ -528,6 +550,7 @@ pub mod incoming {
         let signal_clone = Arc::clone(&signal);
         let signal_data_clone = Arc::clone(&signal_data);
         let conn_status_clone = Arc::clone(&conn_status);
+
         // Spawn the data processing thread
         let t = thread::spawn(move || {
             let mut recv_buf: [u8; 1024] = [0; 1024];
@@ -542,13 +565,12 @@ pub mod incoming {
                         //get addr from signal_data_clone.
                         let addr = signal_data_clone.lock().unwrap();
 
-                        socket.connect(*addr).unwrap();
-
-                        signal_clone.store(SSIGNAL_NONE, Ordering::SeqCst);
-                        nal_builder.reset();
-                        let _ = socket.take_error();
-
-                        conn_status_clone.store(true, Ordering::SeqCst);
+                        if socket.connect(*addr).is_ok() {
+                            signal_clone.store(SSIGNAL_NONE, Ordering::SeqCst);
+                            nal_builder.reset();
+                            let _ = socket.take_error();
+                            conn_status_clone.store(true, Ordering::SeqCst);
+                        }
                     }
                     SSIGNAL_DISCONNECT => {
                         signal_clone.store(SSIGNAL_NONE, Ordering::SeqCst);
@@ -568,6 +590,7 @@ pub mod incoming {
                     continue;
                 }
                 // Data reception - timeout is 100ms
+
                 if let Ok(bytes_read) = socket.recv(&mut recv_buf) {
                     last_packet = Instant::now();
                     nal_builder.add_data(&recv_buf[0..bytes_read]);
@@ -579,6 +602,7 @@ pub mod incoming {
                         }
                     }
                 } else if last_packet.duration_since(Instant::now()) > CONNECTION_TIMEOUT {
+                    dbg!("TINEOUT!");
                     conn_status_clone.store(false, Ordering::SeqCst);
                 }
             }
