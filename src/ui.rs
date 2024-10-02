@@ -29,7 +29,7 @@ impl Plugin for UIElementsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, load_fonts);
         app.add_systems(PostStartup, init_ui);
-        app.add_systems(Update, pretty_button_behavior);
+        app.add_systems(PostUpdate, pretty_button_behavior);
     }
 }
 
@@ -37,11 +37,11 @@ impl Plugin for UIElementsPlugin {
 #[derive(Resource)]
 pub struct UiContainers {
     /// Root ui eleement
-    root: Entity,
+    pub root: Entity,
     /// Left side bar with found hosts
-    host_bar: Entity,
+    pub host_bar: Entity,
     /// Contains incoming stream window, eg. use when setting image to placeholder
-    stream_window: Entity,
+    pub stream_window: Entity,
 }
 /// Marker component for styling behavior
 #[derive(Component)]
@@ -277,11 +277,9 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
         host_bar: Entity::from_raw(0),
     };
     root.with_children(|p| {
-        let mut side_bar = p.spawn(side_bar);
+        let side_bar = p.spawn(side_bar);
         containers.host_bar = side_bar.id();
-        let mut btn = spawner.spawn_pretty_button_with_text("127.0.0.1", 32.);
-        btn.insert(HostButton(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        side_bar.add_child(btn.id());
+
         let mut right_bar = p.spawn(right_side_box);
 
         let mut btn_disconnect = spawner.spawn_pretty_button_with_text("Disconnect", 32.);

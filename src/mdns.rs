@@ -4,14 +4,12 @@ use get_if_addrs::get_if_addrs;
 use lazy_static::lazy_static;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::Duration;
 
 const SERVICE_NAME: &str = "_eye-spy._tcp.local.";
 
 lazy_static! {
     pub static ref MDNS: ServiceDaemon = ServiceDaemon::new().expect("Failed to create daemon");
-    pub static ref MDNS_HOSTS: Mutex<Vec<ServiceInfo>> = Mutex::new(Vec::new());
 }
 
 fn get_local_ip() -> Option<IpAddr> {
@@ -34,7 +32,7 @@ pub(crate) fn start_service() {
     // Create a service info.
     let instance_name = "my_instance";
     let ip = get_local_ip().expect("Cannot find a network interface that isn't loopback.");
-    let host_name = format!("{}.local.", ip.to_string());
+    let host_name = format!("{}.local.", ip);
     let port = 0;
     let properties = [("in_call", false)];
 
@@ -69,15 +67,13 @@ pub(crate) fn find_all_hosts() -> Vec<ServiceInfo> {
             _ => (),
         }
     }
-    let mut mdns_hosts = MDNS_HOSTS.lock().expect("MDNS_HOSTS poisoned. Exiting.");
-    mdns_hosts.clear();
-    mdns_hosts.clone_from_slice(&new_hosts);
+
     new_hosts
 }
 
 #[cfg(test)]
 pub mod mdns_tests {
-    use mdns_sd::{DaemonStatus, Receiver};
+    use mdns_sd::DaemonStatus;
 
     use super::*;
     #[test]

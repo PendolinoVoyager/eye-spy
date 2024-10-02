@@ -524,6 +524,7 @@ pub mod incoming {
             let lock = RGB_FRAME_BUFFER
                 .lock()
                 .map_err(|_| Error::msg("Mutex poisoned"))?;
+
             Err(Error::msg("NOt implemented"))
         }
 
@@ -602,7 +603,6 @@ pub mod incoming {
                         }
                     }
                 } else if last_packet.duration_since(Instant::now()) > CONNECTION_TIMEOUT {
-                    dbg!("TINEOUT!");
                     conn_status_clone.store(false, Ordering::SeqCst);
                 }
             }
@@ -661,9 +661,7 @@ mod tests {
                     }
                     accumulated_data.clear(); // Clear accumulated data after successful decode
                 }
-                Ok(None) => {
-                    dbg!("NONE");
-                }
+                Ok(None) => (),
                 Err(e) => {
                     panic!("Decoder error: {:?}", e);
                 }
