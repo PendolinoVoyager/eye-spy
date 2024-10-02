@@ -3,11 +3,12 @@
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use bevy::prelude::*;
+use bevy::tasks::AsyncComputeTaskPool;
 
 use crate::h264_stream::incoming::{H264IncomingStreamControls, IncomingStreamControls};
 use crate::h264_stream::outgoing::{H264StreamControls, StreamControls};
 use crate::h264_stream::VIDEO_STREAM_PORT;
-use crate::STREAM_IMAGE_HANDLE;
+use crate::{mdns, STREAM_IMAGE_HANDLE};
 
 /// Newtype for H264 stream controls as Bevy resource
 #[derive(Resource)]
@@ -34,7 +35,7 @@ impl Plugin for UILogicPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<OutgoingVideoStreamState>();
         app.init_state::<IncomingVideoStreamState>();
-
+        app.add_event::<FindHostsEvent>();
         app.add_systems(
             Update,
             on_host_button_click.run_if(in_state(OutgoingVideoStreamState::Off)),
@@ -43,6 +44,10 @@ impl Plugin for UILogicPlugin {
         app.add_systems(
             OnEnter(OutgoingVideoStreamState::Off),
             on_disconnect_out_stream,
+        );
+        app.add_systems(
+            Update,
+            on_find_hosts_event.run_if(on_event::<FindHostsEvent>()),
         );
         app.add_systems(
             OnEnter(IncomingVideoStreamState::Off),
@@ -57,8 +62,20 @@ pub struct HostButton(pub IpAddr);
 pub struct ButtonWithRole(pub ButtonRole);
 pub enum ButtonRole {
     Disconnect,
+    FindHosts,
 }
-
+#[derive(Event)]
+pub struct FindHostsEvent;
+/// Spawns a task to find the hosts in a non-blocking way. At the end updates the hosts list.
+fn on_find_hosts_event() {
+    let task_pool = AsyncComputeTaskPool::get();
+    task_pool
+        .spawn(async {
+            let hosts = mdns::find_all_hosts();
+            info!("{:?}", hosts);
+        })
+        .detach();
+}
 /**************************************/
 /************* SYSTEMS ****************/
 /**************************************/
@@ -93,6 +110,7 @@ fn check_role_buttons_click(
     query: Query<(&Interaction, &ButtonWithRole), Changed<Interaction>>,
     mut stream_in_state: ResMut<NextState<IncomingVideoStreamState>>,
     mut stream_out_state: ResMut<NextState<OutgoingVideoStreamState>>,
+    mut writer: EventWriter<FindHostsEvent>,
 ) {
     for (interaction, role) in &query {
         if interaction != &Interaction::Pressed {
@@ -102,6 +120,9 @@ fn check_role_buttons_click(
             ButtonRole::Disconnect => {
                 stream_in_state.set(IncomingVideoStreamState::Off);
                 stream_out_state.set(OutgoingVideoStreamState::Off);
+            }
+            ButtonRole::FindHosts => {
+                writer.send(FindHostsEvent);
             }
         }
     }

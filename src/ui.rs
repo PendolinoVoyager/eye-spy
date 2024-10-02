@@ -290,6 +290,9 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
         right_bar.add_child(btn_disconnect.id());
     });
     commands.insert_resource(containers);
+    spawner
+        .spawn_pretty_button_with_text("Find", 32.)
+        .insert(ButtonWithRole(ButtonRole::FindHosts));
 }
 
 // struct TransformRotationLens {

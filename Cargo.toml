@@ -5,8 +5,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
+bevy_async = "0.0.1"
 bevy_tweening = "0.11.0"
+get_if_addrs = "0.5.3"
 lazy_static = "1.5.0"
+mdns-sd = "0.11.5"
 openh264 = {version = "0.6.2", features=["libloading", "source"]} 
 v4l = "0.14.0"
 

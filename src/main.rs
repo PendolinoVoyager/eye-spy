@@ -5,22 +5,19 @@ use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureFormat};
 use bevy::winit::WinitSettings;
-
 mod h264_stream;
+mod mdns;
 mod scp;
 mod ui;
 mod ui_logic;
 
 use bevy_tweening::TweeningPlugin;
-use h264_stream::incoming::{
-    init_incoming_h264_stream, H264IncomingStreamControls, IncomingStreamControls,
-};
-use h264_stream::outgoing::{init_h264_video_stream, H264StreamControls, StreamControls};
+use h264_stream::incoming::init_incoming_h264_stream;
+use h264_stream::outgoing::init_h264_video_stream;
 use h264_stream::{HEIGHT, RGB_FRAME_BUFFER, WIDTH};
 use ui::UIElementsPlugin;
 use ui_logic::{
     IncomingVideoStreamControls, IncomingVideoStreamState, OutgoingVideoStreamControls,
-    OutgoingVideoStreamState,
 };
 
 pub const STREAM_IMAGE_HANDLE: Handle<Image> = Handle::weak_from_u128(0b00100011010001000101010101101110000011001011010011001111110010000000110000100010001101111111001000011010010010010011001111111101);
@@ -52,6 +49,8 @@ fn update_incoming_stream_image(mut images: ResMut<Assets<Image>>) {
 }
 
 fn main() {
+    mdns::start_service();
+
     let addr_out = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 6969);
     let outgoing_controls = init_h264_video_stream(addr_out).unwrap();
     let incoming_controls = init_incoming_h264_stream().unwrap();
