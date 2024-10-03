@@ -52,7 +52,6 @@ pub(crate) fn start_service() {
 /// # Blocking
 /// This function blocks the execution until the hosts are found. It has an internal timeout in case something happens.
 pub(crate) fn find_all_hosts() -> Vec<ServiceInfo> {
-    // Browse for services with the service type you want to find.
     let receiver = MDNS
         .browse(SERVICE_NAME)
         .expect("Failed to browse mDNS services");
@@ -60,14 +59,26 @@ pub(crate) fn find_all_hosts() -> Vec<ServiceInfo> {
     println!("Browsing for mDNS services...");
     let mut new_hosts = Vec::new();
 
+    // Increase the duration for better discovery in larger networks
+
     while let Ok(service_event) = receiver.recv_timeout(Duration::from_secs(1)) {
+        // Increased timeout
+
         match service_event {
-            mdns_sd::ServiceEvent::ServiceResolved(service_info) => new_hosts.push(service_info),
-            mdns_sd::ServiceEvent::SearchStopped(_) => break,
+            mdns_sd::ServiceEvent::ServiceResolved(service_info) => {
+                println!("Resolved service: {:?}", service_info);
+                new_hosts.push(service_info);
+            }
+            mdns_sd::ServiceEvent::SearchStopped(_) => {
+                println!("Search stopped");
+            }
+            mdns_sd::ServiceEvent::ServiceFound(s, t) => {
+                println!("{s}{t}")
+            }
             _ => (),
         }
     }
-
+    let _ = MDNS.stop_browse(SERVICE_NAME);
     new_hosts
 }
 

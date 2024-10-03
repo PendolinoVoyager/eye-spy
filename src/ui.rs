@@ -1,5 +1,4 @@
 //! Module for UI layout and styling. No logic here.
-use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use bevy::ecs::system::{EntityCommands, SystemParam};
@@ -7,7 +6,7 @@ use bevy::prelude::*;
 use bevy_tweening::lens::UiBackgroundColorLens;
 use bevy_tweening::{Animator, EaseFunction, Tween};
 
-use crate::ui_logic::{ButtonRole, ButtonWithRole, HostButton};
+use crate::ui_logic::{ButtonRole, ButtonWithRole};
 use crate::STREAM_IMAGE_HANDLE;
 
 #[allow(unused)]

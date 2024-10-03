@@ -51,7 +51,7 @@ fn update_incoming_stream_image(mut images: ResMut<Assets<Image>>) {
 fn main() {
     mdns::start_service();
 
-    let addr_out = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 6969);
+    let addr_out = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let outgoing_controls = init_h264_video_stream(addr_out).unwrap();
     let incoming_controls = init_incoming_h264_stream().unwrap();
 

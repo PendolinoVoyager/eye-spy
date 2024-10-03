@@ -158,11 +158,96 @@ pub(crate) mod outgoing {
     use std::time::Duration;
 
     use super::ssignal::*;
+    use super::{CustomStream, H264Stream};
     use openh264::nal_units;
     use v4l::video::Capture;
     use v4l::{Device, Format};
 
-    use super::{CustomStream, H264Stream};
+    /// Context of the thread running the outgoing stream.
+    struct OutgoingH264StreamContext<'a> {
+        stream: Option<H264Stream<'a>>,
+        device: Option<Device>,
+        socket: UdpSocket,
+        signal: Arc<AtomicU8>,
+        signal_data: Arc<Mutex<SocketAddr>>,
+        streaming: bool,
+        addr_bound: bool,
+    }
+    impl OutgoingH264StreamContext<'_> {
+        fn new(signal: Arc<AtomicU8>, signal_data: Arc<Mutex<SocketAddr>>) -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:6969").unwrap();
+            socket.set_nonblocking(true).unwrap();
+
+            Self {
+                stream: None,
+                device: None,
+                socket,
+                signal,
+                signal_data,
+                addr_bound: false,
+                streaming: false,
+            }
+        }
+        fn process_signals(&mut self) {
+            let op_performed = match self.signal.load(std::sync::atomic::Ordering::SeqCst) {
+                SSIGNAL_PAUSE => {
+                    self.streaming = false;
+                    true
+                }
+                SSIGNAL_DISCONNECT => {
+                    self.streaming = false;
+                    self.addr_bound = false;
+
+                    // Drop the stream first, then device that the stream is uging
+                    self.stream.take();
+                    self.device.take();
+
+                    true
+                }
+                SSIGNAL_TERMINATE => {
+                    self.stream.take();
+                    self.device.take();
+                    self.addr_bound = false;
+                    self.streaming = false;
+                    false
+                }
+                SSIGNAL_CONNECT => {
+                    // Re-initialize the stream and device on connect
+                    if let Ok(addr) = self.signal_data.lock() {
+                        self.socket.connect(addr.to_string()).unwrap();
+                        self.streaming = true;
+                        self.addr_bound = true;
+
+                        // Initialize the stream and device only if they are not already running
+                        if self.stream.is_none() || self.device.is_none() {
+                            let (new_stream, new_dev) = init_inner_stream();
+                            self.stream = Some(new_stream);
+                            self.device = Some(new_dev);
+                        }
+
+                        // Force an intra-frame on the encoder
+                        if let Some(ref mut stream_ref) = self.stream {
+                            stream_ref.encoder.force_intra_frame();
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                SSIGNAL_RESUME => {
+                    self.streaming = true;
+                    true
+                }
+                _ => false,
+            };
+
+            // Reset the signal to not duplicate operations
+            if op_performed {
+                self.signal
+                    .store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
 
     pub trait StreamControls {
         /// Connect to an address to send data to from given port
@@ -247,77 +332,24 @@ pub(crate) mod outgoing {
 
         // Spawn a thread to control the stream
         let t = std::thread::spawn(move || {
-            let mut stream: Option<H264Stream> = None;
-            let mut dev: Option<Device> = None;
-            let socket = UdpSocket::bind("127.0.0.1:6969").unwrap();
-            socket.set_nonblocking(true).unwrap();
-            let mut streaming = false;
-            let mut addr_bound = false;
+            let mut stream_context =
+                OutgoingH264StreamContext::new(signal_clone, signal_data_clone);
 
             loop {
-                // Read the atomic signal frequently
-                let op_performed = match signal_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                    SSIGNAL_PAUSE => {
-                        streaming = false;
-                        true
-                    }
-                    SSIGNAL_DISCONNECT => {
-                        streaming = false;
-                        addr_bound = false;
+                stream_context.process_signals();
 
-                        // Drop the stream first, then device that the stream is uging
-                        stream.take();
-                        dev.take();
-
-                        true
-                    }
-                    SSIGNAL_TERMINATE => {
-                        stream.take();
-                        dev.take();
+                if !stream_context.streaming || !stream_context.addr_bound {
+                    //  signal terminate won't be "taken" after reading, persisting after processing
+                    //  process_signals() only shuts down the thing, breaking has to be done inside the loop
+                    if stream_context.signal.load(Ordering::Relaxed) == SSIGNAL_TERMINATE {
                         break;
                     }
-                    SSIGNAL_CONNECT => {
-                        // Re-initialize the stream and device on connect
-                        if let Ok(addr) = signal_data_clone.lock() {
-                            socket.connect(addr.to_string()).unwrap();
-                            streaming = true;
-                            addr_bound = true;
-
-                            // Initialize the stream and device only if they are not already running
-                            if stream.is_none() || dev.is_none() {
-                                let (new_stream, new_dev) = init_inner_stream();
-                                stream = Some(new_stream);
-                                dev = Some(new_dev);
-                            }
-
-                            // Force an intra-frame on the encoder
-                            if let Some(ref mut stream_ref) = stream {
-                                stream_ref.encoder.force_intra_frame();
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    SSIGNAL_RESUME => {
-                        streaming = true;
-                        true
-                    }
-                    _ => false,
-                };
-
-                // Reset the signal to not duplicate operations
-                if op_performed {
-                    signal_clone.store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
-                }
-
-                if !streaming || !addr_bound {
                     std::thread::sleep(Duration::from_millis(30));
 
                     continue;
                 }
 
-                if let Some(ref mut stream_ref) = stream {
+                if let Some(ref mut stream_ref) = stream_context.stream {
                     if let Some(buf) = stream_ref.next_vec() {
                         for unit in nal_units(&buf) {
                             for (num, packet) in
@@ -330,9 +362,9 @@ pub(crate) mod outgoing {
                                 let num_as_bytes = (num as u32 + 1).to_le_bytes(); // Convert num (usize) to 4 bytes (u32)
                                 packet_with_ident.extend_from_slice(&num_as_bytes); // Append the identifier
 
-                                let _ = socket.send(&packet_with_ident);
+                                let _ = stream_context.socket.send(&packet_with_ident);
                             }
-                            let _ = socket.send(super::FRAME_END);
+                            let _ = stream_context.socket.send(super::FRAME_END);
                         }
                     }
                 }
