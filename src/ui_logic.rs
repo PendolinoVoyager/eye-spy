@@ -127,9 +127,9 @@ fn update_host_list(
     if let Some(mut list) = commands.get_entity(ui_containers.host_bar) {
         list.despawn_descendants();
         for host in &available_hosts.0 {
-            let mut btn = spawner.spawn_pretty_button_with_text(&host.get_port().to_string(), 32.);
-            if let Ok(ip_addr) = Ipv4Addr::from_str(host.get_hostname()) {
-                btn.insert(HostButton(IpAddr::V4(ip_addr)));
+            let mut btn = spawner.spawn_pretty_button_with_text(host.get_hostname(), 32.);
+            if let Some(ip_addr) = host.get_addresses_v4().iter().next() {
+                btn.insert(HostButton(IpAddr::V4(**ip_addr)));
             }
 
             list.add_child(btn.id());
