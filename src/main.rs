@@ -7,7 +7,6 @@ use bevy::render::render_resource::{Extent3d, TextureFormat};
 use bevy::winit::WinitSettings;
 mod h264_stream;
 mod mdns;
-mod scp;
 mod ui;
 mod ui_logic;
 

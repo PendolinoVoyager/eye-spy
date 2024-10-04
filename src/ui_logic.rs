@@ -1,7 +1,6 @@
 //! Module for UI states and logic.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::str::FromStr;
 
 use bevy::ecs::world::CommandQueue;
 use bevy::prelude::*;
@@ -131,7 +130,6 @@ fn update_host_list(
             if let Some(ip_addr) = host.get_addresses_v4().iter().next() {
                 btn.insert(HostButton(IpAddr::V4(**ip_addr)));
             }
-
             list.add_child(btn.id());
         }
         let mut btn = spawner.spawn_pretty_button_with_text("127.0.0.1", 32.);
@@ -160,8 +158,10 @@ fn on_host_button_click(
             };
             stream_out_state.set(OutgoingVideoStreamState::On);
             stream_in_state.set(IncomingVideoStreamState::On);
-            v_stream.0.connect(sock_addr);
-            incoming.0.accept(v_stream.0.address).unwrap();
+            v_stream.0.connect(sock_addr); // Outgoing - sending to 7000
+            let mut in_addr = sock_addr;
+            in_addr.set_port(6969);
+            incoming.0.accept(in_addr).unwrap(); // incoming - connecting to 6969
         }
     }
 }

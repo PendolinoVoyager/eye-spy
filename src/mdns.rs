@@ -30,7 +30,7 @@ fn get_local_ip() -> Option<IpAddr> {
 /// It should be run once at the start somewhere in main()
 pub(crate) fn start_service() {
     // Create a service info.
-    let instance_name = "my_instance";
+    let instance_name = uuid::Uuid::new_v4();
     let ip = get_local_ip().expect("Cannot find a network interface that isn't loopback.");
     let host_name = format!("{}.local.", ip);
     let port = 0;
@@ -38,7 +38,7 @@ pub(crate) fn start_service() {
 
     let my_service = ServiceInfo::new(
         SERVICE_NAME,
-        instance_name,
+        &instance_name.to_string(),
         &host_name,
         ip,
         port,

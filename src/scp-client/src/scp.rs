@@ -78,7 +78,7 @@ impl SCPMessage {
 #[repr(u16)]
 pub enum SCPCommand {
     Start,
-    // Connection is established with an encryption key prepared earlier
+    // Connection is established with an encryption key prepared earlier, skips key_share to later stages
     OwnKeyRequired,
 
     ReqGenerateKey,

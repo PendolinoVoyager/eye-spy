@@ -189,63 +189,62 @@ pub(crate) mod outgoing {
             }
         }
         fn process_signals(&mut self) {
-            let op_performed = match self.signal.load(std::sync::atomic::Ordering::SeqCst) {
+            let signal_value = self.signal.load(std::sync::atomic::Ordering::SeqCst);
+            let mut op_performed = false;
+
+            match signal_value {
                 SSIGNAL_PAUSE => {
                     self.streaming = false;
-                    true
+                    op_performed = true;
                 }
-                SSIGNAL_DISCONNECT => {
-                    self.streaming = false;
-                    self.addr_bound = false;
-
-                    // Drop the stream first, then device that the stream is uging
-                    self.stream.take();
-                    self.device.take();
-
-                    true
-                }
-                SSIGNAL_TERMINATE => {
-                    self.stream.take();
-                    self.device.take();
+                SSIGNAL_DISCONNECT | SSIGNAL_TERMINATE => {
+                    self.drop_stream_and_device();
                     self.addr_bound = false;
                     self.streaming = false;
-                    false
+                    op_performed = signal_value == SSIGNAL_DISCONNECT;
                 }
                 SSIGNAL_CONNECT => {
-                    // Re-initialize the stream and device on connect
                     if let Ok(addr) = self.signal_data.lock() {
-                        self.socket.connect(addr.to_string()).unwrap();
+                        if let Err(err) = self.socket.connect(addr.to_string()) {
+                            eprintln!(
+                                "Cannot connect to socket waiting for H264 stream: {:?}",
+                                err
+                            );
+                            return;
+                        }
+
                         self.streaming = true;
                         self.addr_bound = true;
-
-                        // Initialize the stream and device only if they are not already running
                         if self.stream.is_none() || self.device.is_none() {
                             let (new_stream, new_dev) = init_inner_stream();
                             self.stream = Some(new_stream);
                             self.device = Some(new_dev);
                         }
-
-                        // Force an intra-frame on the encoder
+                        // Force an intra-frame
                         if let Some(ref mut stream_ref) = self.stream {
                             stream_ref.encoder.force_intra_frame();
                         }
-                        true
-                    } else {
-                        false
+
+                        op_performed = true;
                     }
                 }
                 SSIGNAL_RESUME => {
                     self.streaming = true;
-                    true
+                    op_performed = true;
                 }
-                _ => false,
-            };
+                _ => {}
+            }
 
-            // Reset the signal to not duplicate operations
+            // Reset the signal if an operation was performed
             if op_performed {
                 self.signal
                     .store(SSIGNAL_NONE, std::sync::atomic::Ordering::SeqCst);
             }
+        }
+
+        fn drop_stream_and_device(&mut self) {
+            self.stream.take();
+            self.device.take();
         }
     }
 

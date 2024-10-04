@@ -11,6 +11,8 @@ get_if_addrs = "0.5.3"
 lazy_static = "1.5.0"
 mdns-sd = "0.11.5"
 openh264 = {version = "0.6.2", features=["libloading", "source"]} 
+scp-client = { path = "./src/scp-client" }
+uuid = "1.10.0"
 v4l = "0.14.0"
 
 [profile.dev]

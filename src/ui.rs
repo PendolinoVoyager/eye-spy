@@ -163,8 +163,12 @@ pub fn pretty_button_behavior(
     mut commands: Commands,
     mut window: Query<&mut Window>,
 ) {
-    let mut window = window.single_mut();
-
+    let window = window.get_single_mut();
+    // Just in case, because it can happen
+    if window.is_err() {
+        return;
+    }
+    let mut window = window.unwrap();
     for (entity, interaction, bg) in &query {
         match *interaction {
             Interaction::Pressed => {
