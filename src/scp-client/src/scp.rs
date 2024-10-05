@@ -8,27 +8,27 @@ const SCP_END: &[u8] = b"1234564321\n";
 
 /// Byte structure: <HEADER><COMMAND(16bits)><BODY><NEWLINE><END>
 #[derive(Clone, Debug)]
-pub struct SCPMessage {
+pub struct ScpMessage {
     pub body: Vec<u8>,
-    pub command: SCPCommand,
+    pub command: ScpCommand,
 }
 
-impl SCPMessage {
+impl ScpMessage {
     /// #Panics
     /// Panics if the message cannot be constructed due to missing body when needed
-    fn new(command: SCPCommand, body: &[u8]) -> Self {
+    pub fn new(command: ScpCommand, body: &[u8]) -> Self {
         if command.requires_body() && body.is_empty() {
             panic!(
                 "Tried to create an invalid SCP message: {:?}, {:?}",
                 command, body
             );
         }
-        SCPMessage {
+        ScpMessage {
             command,
             body: body.to_vec(),
         }
     }
-    fn as_bytes(&self) -> Vec<u8> {
+    pub fn as_bytes(&self) -> Vec<u8> {
         [
             SCP_HEADER,
             &(self.command as u16).to_le_bytes(),
@@ -42,9 +42,9 @@ impl SCPMessage {
         .cloned()
         .collect()
     }
-    fn deserialize(raw: &[u8]) -> Result<SCPMessage, SCPParseError> {
+    pub fn deserialize(raw: &[u8]) -> Result<ScpMessage, SCPParseError> {
         const H_LEN: usize = SCP_HEADER.len();
-        const C_LEN: usize = std::mem::size_of::<SCPCommand>();
+        const C_LEN: usize = std::mem::size_of::<ScpCommand>();
         if !raw.starts_with(SCP_HEADER) {
             return Err(SCPParseError::BadStructure);
         }
@@ -59,7 +59,7 @@ impl SCPMessage {
         // Shouldn't panic: already checked for SCP_END
         let command;
         unsafe {
-            command = std::mem::transmute::<[u8; C_LEN], SCPCommand>(*command_raw);
+            command = std::mem::transmute::<[u8; C_LEN], ScpCommand>(*command_raw);
         }
         let (body_raw, end) = raw.split_at(raw.len() - H_LEN);
         // End must contains newline and SCP_END
@@ -74,9 +74,9 @@ impl SCPMessage {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u16)]
-pub enum SCPCommand {
+pub enum ScpCommand {
     Start,
     // Connection is established with an encryption key prepared earlier, skips key_share to later stages
     OwnKeyRequired,
@@ -96,20 +96,20 @@ pub enum SCPCommand {
     End,
 }
 
-impl SCPCommand {
+impl ScpCommand {
     pub fn requires_body(&self) -> bool {
         match self {
-            SCPCommand::Start => false,
-            SCPCommand::OwnKeyRequired => false,
-            SCPCommand::ReqGenerateKey => false,
-            SCPCommand::AckGenerateKey => false,
-            SCPCommand::KeyShare => true,
-            SCPCommand::SimpleMessage => true,
-            SCPCommand::VideoStreamConnect => false,
-            SCPCommand::AudioStreamConnect => false,
-            SCPCommand::VideoStreamStop => false,
-            SCPCommand::AudioStreamStop => false,
-            SCPCommand::End => false,
+            ScpCommand::Start => false,
+            ScpCommand::OwnKeyRequired => false,
+            ScpCommand::ReqGenerateKey => false,
+            ScpCommand::AckGenerateKey => false,
+            ScpCommand::KeyShare => true,
+            ScpCommand::SimpleMessage => true,
+            ScpCommand::VideoStreamConnect => false,
+            ScpCommand::AudioStreamConnect => false,
+            ScpCommand::VideoStreamStop => false,
+            ScpCommand::AudioStreamStop => false,
+            ScpCommand::End => false,
         }
     }
 }
@@ -146,14 +146,14 @@ impl std::error::Error for SCPParseError {}
 #[cfg(test)]
 mod tests_scp {
 
-    use crate::scp::{SCPMessage, SCPParseError};
+    use crate::scp::{SCPParseError, ScpMessage};
 
-    use super::{SCPCommand, SCP_END, SCP_HEADER};
+    use super::{ScpCommand, SCP_END, SCP_HEADER};
 
     fn get_correct_message() -> Vec<u8> {
         [
             SCP_HEADER,
-            &(SCPCommand::SimpleMessage as u16).to_le_bytes(),
+            &(ScpCommand::SimpleMessage as u16).to_le_bytes(),
             b"Hello\n",
             SCP_END,
         ]
@@ -166,7 +166,7 @@ mod tests_scp {
     fn get_bad_message() -> Vec<u8> {
         [
             SCP_HEADER,
-            &(SCPCommand::KeyShare as u16).to_le_bytes(),
+            &(ScpCommand::KeyShare as u16).to_le_bytes(),
             b"\n",
             SCP_END,
         ]
@@ -178,7 +178,7 @@ mod tests_scp {
     }
     #[test]
     fn test_scp_deserialization() {
-        let msg = SCPMessage::deserialize(&get_correct_message());
+        let msg = ScpMessage::deserialize(&get_correct_message());
         assert!(msg.is_ok());
         let msg = msg.unwrap();
         let string_msg = String::from_utf8_lossy(&msg.body);
@@ -186,7 +186,7 @@ mod tests_scp {
     }
     #[test]
     fn test_bad_scp() {
-        let msg = SCPMessage::deserialize(&get_bad_message());
+        let msg = ScpMessage::deserialize(&get_bad_message());
         assert!(msg.is_err());
         assert!(msg.is_err_and(|e| e == SCPParseError::MissingBody))
     }
