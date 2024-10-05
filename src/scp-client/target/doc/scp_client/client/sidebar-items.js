@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["AudioEncoding","ConnectionAction","ConnectionEvent","ScpConnectionError","VideoEncoding"],"struct":["ConnectionSetings","ScpClient","ScpClientBuilder","SessionConfig"]};
