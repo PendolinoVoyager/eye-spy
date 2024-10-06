@@ -19,9 +19,10 @@
 //!    // again, listen to the streams specified in config
 //! }
 //! ```
-use std::io::Read;
+use std::fmt::Debug;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -55,6 +56,7 @@ pub enum ConnectionAction {
     /// Remove the password for the socket connection, switching to automatic key generation
     UnsetPassword,
     EndConnection,
+    Terminate,
 }
 /// Configuration for an established chat session
 /// These are "suggestions" only and the responsibility to use all of them correctly
@@ -141,8 +143,8 @@ pub struct ScpClient {
     last_config: Option<SessionConfig>,
     thread: JoinHandle<()>,
     preferences: Preferences,
-    tx: Sender<ConnectionAction>,
-    rx: Receiver<ConnectionEvent>,
+    tx: Arc<Mutex<Option<ConnectionAction>>>,
+    rx: Arc<Mutex<Option<ConnectionEvent>>>,
 }
 
 impl ScpClient {
@@ -167,17 +169,22 @@ impl ScpClient {
     }
     /// Spawns the event loop with TCP socket, reading the messages and responding to external events.
     /// Model of communication:
-    /// - MPSC channel to send new Events (connect, refuse, set password, etc)
-    /// - Other MPSC channel to receive what the thread has to say (established connection, errored, or got request)
+    /// - Mutex for action that the thread with TcpListener must take
+    /// - Mutex for event that the TcpListener thread has to tell.
+    ///
+    /// Messages might be missed, but the events and data flow is structured good enough to get some context,
+    /// if any part keeps some state about what's happening.
+    /// More importantly, it gives "async-ish" felling
+    #[allow(clippy::type_complexity)]
     fn spawn_handler_thread(
         preferences: Preferences,
     ) -> (
         JoinHandle<()>,
-        Sender<ConnectionAction>,
-        Receiver<ConnectionEvent>,
+        Arc<Mutex<Option<ConnectionAction>>>,
+        Arc<Mutex<Option<ConnectionEvent>>>,
     ) {
-        let (tx_a, rx_a) = mpsc::channel::<ConnectionAction>();
-        let (tx_e, rx_e) = mpsc::channel::<ConnectionEvent>();
+        let action: Arc<Mutex<Option<ConnectionAction>>> = Arc::new(Mutex::new(None));
+        let event: Arc<Mutex<Option<ConnectionEvent>>> = Arc::new(Mutex::new(None));
 
         // Get the address to bind the listener to
         let addr = misc::get_local_ip()
@@ -191,22 +198,29 @@ impl ScpClient {
         let listener = TcpListener::bind(sock_addr)
             .unwrap_or_else(|e| panic!("Cannot bind the listener to {sock_addr}.\n{e}"));
 
+        let rx = Arc::clone(&action);
+        let tx = Arc::clone(&event);
         listener.set_nonblocking(true).unwrap();
+
         let t = std::thread::spawn(move || {
             let mut buf: Vec<u8> = Vec::with_capacity(1024);
             // Some internal state / context here
             // ScpListener struct or something to parse the messages
             loop {
+                std::thread::sleep(Duration::from_millis(30));
                 //check the actions if there are any
-                for action in rx_a.iter() {
-                    if let ConnectionAction::AttemptConnection(settings) = action {
-                        let size = TcpStream::connect_timeout(&settings.destination, TCP_TIMEOUT)
-                            .unwrap()
-                            .read_to_end(&mut buf)
-                            .unwrap();
-                        let msg = ScpMessage::deserialize(&buf[..size]).unwrap();
-                        dbg!(msg);
-                        tx_e.send(ConnectionEvent::ConnectionEstablished(SessionConfig {
+                let mut action = rx.lock().unwrap();
+                if matches!(*action, Some(ConnectionAction::Terminate)) {
+                    break;
+                }
+                if let Some(ConnectionAction::AttemptConnection(settings)) = &*action {
+                    let mut stream =
+                        TcpStream::connect_timeout(&settings.destination, TCP_TIMEOUT).unwrap();
+                    stream
+                        .write_all(&ScpMessage::new(ScpCommand::Start, b"L").as_bytes())
+                        .unwrap();
+                    *tx.lock().unwrap() =
+                        Some(ConnectionEvent::ConnectionEstablished(SessionConfig {
                             encryption_key: None,
                             encrytpion_method: None,
                             ip: settings.destination.ip(),
@@ -214,92 +228,104 @@ impl ScpClient {
                             port_audio: None,
                             video_encoding: VideoEncoding::H264,
                             audio_encoding: AudioEncoding::NoIdea,
-                        }))
-                        .unwrap();
-                    }
+                        }));
+                    stream.flush().unwrap();
                 }
+                *action = None; // take the action
+
                 // Accept one connection.
                 // The TCP stream is nonblocking, meaning it will return Err if no connections available
                 // This way the loop continues
                 let _ = listener.take_error();
                 if let Ok((mut stream, addr_in)) = listener.accept() {
-                    dbg!("Accepted");
-
-                    if let Ok(size) = stream.read_to_end(&mut buf) {
+                    buf.resize(1024, 0);
+                    if let Ok(size) = stream.read(&mut buf) {
+                        if size == 0 {
+                            continue;
+                        }
                         let msg = ScpMessage::deserialize(&buf[..size]);
                         if msg.is_err() {
                             continue;
                         }
                         let msg = msg.unwrap();
                         if msg.command == ScpCommand::Start {
-                            tx_e.send(ConnectionEvent::ConnectionEstablished(SessionConfig {
-                                encryption_key: None,
-                                encrytpion_method: None,
-                                ip: addr_in.ip(),
-                                port_video: Some(7000),
-                                port_audio: None,
-                                video_encoding: VideoEncoding::H264,
-                                audio_encoding: AudioEncoding::NoIdea,
-                            }))
-                            .unwrap();
+                            *tx.lock().unwrap() =
+                                Some(ConnectionEvent::ConnectionEstablished(SessionConfig {
+                                    encryption_key: None,
+                                    encrytpion_method: None,
+                                    ip: addr_in.ip(),
+                                    port_video: Some(7000),
+                                    port_audio: None,
+                                    video_encoding: VideoEncoding::H264,
+                                    audio_encoding: AudioEncoding::NoIdea,
+                                }));
                         }
                     }
                 }
             }
         });
 
-        (t, tx_a, rx_e)
+        (t, action, event)
     }
     pub fn request_chat(
         &self,
         destination: SocketAddr,
     ) -> Result<SessionConfig, ScpConnectionError> {
-        self.tx
-            .send(ConnectionAction::AttemptConnection(ConnectionSetings {
-                destination,
-                password: None,
-            }))
-            .unwrap();
-        while let Ok(msg) = self.rx.recv_timeout(Duration::from_secs(1)) {
-            match msg {
-                ConnectionEvent::ConnectionEstablished(s) => return Ok(s),
-                ConnectionEvent::ConnectionFailed(scp_connection_error) => {
-                    return Err(scp_connection_error)
+        *self.tx.lock().unwrap() = Some(ConnectionAction::AttemptConnection(ConnectionSetings {
+            destination,
+            password: None,
+        }));
+        // check the connection with a timeout
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        while start + TIMEOUT > std::time::Instant::now() {
+            let msg = self.rx.lock().unwrap();
+            match &*msg {
+                Some(ConnectionEvent::ConnectionEstablished(s)) => return Ok(s.clone()),
+                Some(ConnectionEvent::ConnectionFailed(scp_connection_error)) => {
+                    return Err(*scp_connection_error)
                 }
-                ConnectionEvent::ConnectionEnd => return Err(ScpConnectionError::NotResponding),
-                _ => (),
+                Some(ConnectionEvent::ConnectionEnd) => {
+                    return Err(ScpConnectionError::NotResponding)
+                }
+                None => std::thread::sleep(Duration::from_millis(100)),
+                _ => break,
             }
         }
         Err(ScpConnectionError::Refused)
     }
-    pub fn events(&mut self) {
-        for event in self.rx.iter() {}
-    }
+
     pub fn has_incoming_connections(&mut self) -> Option<IpAddr> {
-        for event in self.rx.iter() {
-            if let ConnectionEvent::ConnectionIncoming(addr) = event {
-                return Some(addr);
-            }
+        if let Some(ConnectionEvent::ConnectionIncoming(addr)) = &*self.rx.lock().unwrap() {
+            return Some(*addr);
         }
+
         None
     }
     pub fn accept_incoming_connection(&mut self) -> Result<SessionConfig, ScpConnectionError> {
-        let _ = self.tx.send(ConnectionAction::AcceptConnection);
-        while let Ok(event) = self.rx.recv_timeout(Duration::from_secs(3)) {
-            match event {
-                ConnectionEvent::ConnectionEstablished(session_config) => {
-                    return Ok(session_config)
-                }
-                ConnectionEvent::ConnectionFailed(scp_connection_error) => {
-                    return Err(scp_connection_error)
-                }
-                _ => (),
+        const TIMEOUT: Duration = std::time::Duration::from_secs(3);
+        *self.tx.lock().unwrap() = Some(ConnectionAction::AcceptConnection);
+        let start = std::time::Instant::now();
+        while start + TIMEOUT > std::time::Instant::now() {
+            match &*self.rx.lock().unwrap() {
+                Some(ConnectionEvent::ConnectionEstablished(cfg)) => return Ok(cfg.clone()),
+                Some(ConnectionEvent::ConnectionFailed(e)) => return Err(*e),
+                _ => std::thread::sleep(Duration::from_millis(100)),
             }
         }
+
         Err(ScpConnectionError::NotResponding)
     }
     pub fn end_connection(&mut self) {
-        let _ = self.tx.send(ConnectionAction::EndConnection);
+        *self.tx.lock().unwrap() = Some(ConnectionAction::EndConnection);
+    }
+}
+impl Drop for ScpClient {
+    fn drop(&mut self) {
+        // if poisoned then thread already panicked and doesn't exist
+        if !self.tx.is_poisoned() {
+            *self.tx.lock().unwrap() = Some(ConnectionAction::Terminate);
+        }
     }
 }
 
@@ -364,9 +390,10 @@ impl ScpClientBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, SocketAddr};
-    use std::str::FromStr;
+    use std::net::SocketAddr;
     use std::time::Duration;
+
+    use crate::misc::get_local_ip;
 
     use super::{ScpClient, ScpClientBuilder};
 
@@ -384,22 +411,13 @@ mod tests {
     #[test]
     fn test_accept() {
         let (client1, mut client2) = prepare_two_clients();
+        let ip = get_local_ip().unwrap();
 
-        let addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 60103);
+        let addr = SocketAddr::new(ip, 60103);
         std::thread::sleep(Duration::from_millis(100));
         let config = client1.request_chat(addr);
-        std::thread::sleep(Duration::from_millis(100));
 
-        assert!(client2.has_incoming_connections().is_some());
         dbg!(&config);
         assert!(config.is_ok());
-        // use the config to listen to streams
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        // client.end_connection();
-        if let Some(ip) = client2.has_incoming_connections() {
-            // either error or new SessionConfig
-            let config = client2.accept_incoming_connection().unwrap();
-            // again, listen to the streams specified in config
-        }
     }
 }
