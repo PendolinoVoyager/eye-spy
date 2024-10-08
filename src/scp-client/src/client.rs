@@ -239,9 +239,10 @@ impl ScpClient {
         *self.tx.0.lock().unwrap() = Some(ConnectionAction::AcceptConnection);
         self.tx.1.notify_one();
         let (lock, cvar) = &*self.rx;
-
         let _ = cvar.wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |event| event.is_none());
-        match &*lock.lock().unwrap() {
+        let val = &*lock.lock().unwrap();
+
+        match val {
             Some(ConnectionEvent::ConnectionEstablished(s)) => Ok(s.clone()),
             Some(ConnectionEvent::ConnectionFailed(e)) => Err(*e),
             _ => Err(ScpConnectionError::NotResponding),
@@ -349,8 +350,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let config = client1.request_chat(addr);
         std::thread::sleep(Duration::from_millis(300));
-        let _ = client2.accept_incoming_connection();
-        dbg!(&config);
+        let config2 = client2.accept_incoming_connection();
         assert!(config.is_ok());
+        assert!(config2.is_ok());
     }
 }

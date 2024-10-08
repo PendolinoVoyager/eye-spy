@@ -7,13 +7,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use serde_json::{Deserializer, Serializer};
+use serde_json::Deserializer;
 
 use crate::client::{
     ActionConnector, ConnectionAction, ConnectionEvent, ConnectionSetings, EventConnector,
     Preferences, SessionConfig,
 };
-use crate::misc::{self, any_as_u8_slice};
+use crate::misc::{self};
 use crate::scp::{ScpCommand, ScpMessage};
 const TCP_TIMEOUT: Duration = Duration::from_secs(1);
 const EVENT_LOOP_MIN_TIME: Duration = Duration::from_millis(30);
@@ -99,7 +99,10 @@ impl ScpListener {
                 self.on_attempt_connection_action(&settings)
             }
             ConnectionAction::RefuseConnection => self.end_connection(),
-            ConnectionAction::AcceptConnection => self.share_config(),
+            ConnectionAction::AcceptConnection => {
+                self.share_config();
+                self.finalize_connection();
+            }
             ConnectionAction::SetPassword(_) => todo!(),
             ConnectionAction::UnsetPassword => todo!(),
             ConnectionAction::EndConnection => self.end_connection(),
@@ -208,6 +211,7 @@ impl ScpListener {
         let mut deser = Deserializer::from_slice(&msg.body);
         let preferences = Preferences::deserialize(&mut deser);
         if let Ok(p) = preferences {
+            self.got_preferences = Some(p);
             match self.state {
                 ConnectionState::Handshake => self.share_config(),
                 ConnectionState::ConfigShared => {
@@ -217,9 +221,8 @@ impl ScpListener {
                     self.state = ConnectionState::Awaiting;
                 }
                 ConnectionState::Awaiting => self.finalize_connection(),
-                _ => return,
+                _ => (),
             }
-            self.got_preferences = Some(p);
         } else {
             self.end_connection();
         }
@@ -231,7 +234,7 @@ impl ScpListener {
             if t.is_err() {
                 self.end_connection();
             }
-            let size = TcpStream::connect(addr_in)
+            let _ = TcpStream::connect(addr_in)
                 .unwrap()
                 .write(&ScpMessage::new(ScpCommand::PreferencesShare, &t.unwrap()).as_bytes());
             self.state = ConnectionState::ConfigShared;
@@ -246,7 +249,7 @@ impl ScpListener {
             ip: self.communicating_with.expect("Invalid finalize connection call. Expected to have a peer communicating with, got None.").ip(),
             stream_config: self.got_preferences.expect("Cannot finalize connection with no preferences"),
         }));
-        self.event.1.notify_all();
+        self.event.1.notify_one();
         self.state = ConnectionState::Connected;
     }
 }
