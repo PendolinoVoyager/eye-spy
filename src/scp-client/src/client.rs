@@ -24,6 +24,7 @@
 //! client.end_connection();
 //!
 //! ```
+use core::panic;
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};
@@ -74,24 +75,23 @@ pub struct SessionConfig {
     pub encryption_key: Option<String>,
     pub encrytpion_method: Option<bool>,
     pub ip: IpAddr,
-    pub port_video: Option<u16>,
-    pub port_audio: Option<u16>,
-    pub video_encoding: VideoEncoding,
-    pub audio_encoding: AudioEncoding,
+    pub(crate) stream_config: Preferences,
 }
 
 /// Available video encoding formats
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum VideoEncoding {
     H264,
 }
 /// Available audio encoding formats
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum AudioEncoding {
     NoIdea,
 }
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
 #[derive(Clone, Copy, Debug, Error)]
 /// Errors that may arise when establishing a session fails.
 /// Some of the errors may require only small changes to provided config
@@ -107,15 +107,18 @@ pub enum ScpConnectionError {
     #[error("ScpClient is already connected somewhere")]
     AlreadyConnected,
 }
+
 /// Preferences that ScpClient takes when etablishing a connection
-#[derive(Clone, Copy, Debug)]
-struct Preferences {
-    video_encoding: VideoEncoding,
-    audio_encoding: AudioEncoding,
-    port_in_video: u16,
-    port_in_audio: u16,
-    port_scp: u16,
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Preferences {
+    pub video_encoding: VideoEncoding,
+    pub audio_encoding: AudioEncoding,
+    pub port_in_video: u16,
+    pub port_in_audio: u16,
+    pub port_scp: u16,
 }
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -145,7 +148,6 @@ pub type EventConnector = Arc<(Mutex<Option<ConnectionEvent>>, Condvar)>;
 // Just that, all implementation is hidden otherwise
 
 pub struct ScpClient {
-    last_config: Option<SessionConfig>,
     preferences: Preferences,
     tx: ActionConnector,
     rx: EventConnector,
@@ -164,7 +166,6 @@ impl ScpClient {
         let (tx, rx) = Self::spawn_handler_thread(preferences);
 
         Self {
-            last_config: None,
             preferences,
             tx,
             rx,
@@ -185,7 +186,7 @@ impl ScpClient {
         let rx = Arc::clone(&action);
         let tx = Arc::clone(&event);
 
-        let mut listener = ScpListener::new(rx, tx, preferences.port_scp);
+        let mut listener = ScpListener::new(rx, tx, preferences);
         std::thread::spawn(move || loop {
             match listener.handle_event_loop() {
                 Ok(()) => continue,
@@ -223,27 +224,28 @@ impl ScpClient {
             _ => Err(ScpConnectionError::NotResponding),
         }
     }
-
     pub fn has_incoming_connections(&mut self) -> Option<IpAddr> {
+        dbg!("Waiting for Incoming!,");
+
         if let Some(ConnectionEvent::ConnectionIncoming(addr)) = &*self.rx.0.lock().unwrap() {
             return Some(*addr);
         }
 
         None
     }
+    /// Blocking function. If no incoming connections, it will wait until there's one available.
     pub fn accept_incoming_connection(&mut self) -> Result<SessionConfig, ScpConnectionError> {
         const TIMEOUT: Duration = std::time::Duration::from_secs(3);
         *self.tx.0.lock().unwrap() = Some(ConnectionAction::AcceptConnection);
-        let start = std::time::Instant::now();
-        while start + TIMEOUT > std::time::Instant::now() {
-            match &*self.rx.0.lock().unwrap() {
-                Some(ConnectionEvent::ConnectionEstablished(cfg)) => return Ok(cfg.clone()),
-                Some(ConnectionEvent::ConnectionFailed(e)) => return Err(*e),
-                _ => std::thread::sleep(Duration::from_millis(100)),
-            }
-        }
+        self.tx.1.notify_one();
+        let (lock, cvar) = &*self.rx;
 
-        Err(ScpConnectionError::NotResponding)
+        let _ = cvar.wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |event| event.is_none());
+        match &*lock.lock().unwrap() {
+            Some(ConnectionEvent::ConnectionEstablished(s)) => Ok(s.clone()),
+            Some(ConnectionEvent::ConnectionFailed(e)) => Err(*e),
+            _ => Err(ScpConnectionError::NotResponding),
+        }
     }
     pub fn end_connection(&mut self) {
         *self.tx.0.lock().unwrap() = Some(ConnectionAction::EndConnection);
@@ -340,13 +342,15 @@ mod tests {
     }
     #[test]
     fn test_accept() {
-        let (client1, _client2) = prepare_two_clients();
+        let (client1, mut client2) = prepare_two_clients();
         let ip = get_local_ip().unwrap();
 
         let addr = SocketAddr::new(ip, 60103);
         std::thread::sleep(Duration::from_millis(100));
         let config = client1.request_chat(addr);
-
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = client2.accept_incoming_connection();
+        dbg!(&config);
         assert!(config.is_ok());
     }
 }

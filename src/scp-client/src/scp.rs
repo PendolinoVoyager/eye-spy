@@ -77,6 +77,7 @@ impl ScpMessage {
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u16)]
 pub enum ScpCommand {
+    // Start expects listener port
     Start,
     // Connection is established with an encryption key prepared earlier, skips key_share to later stages
     OwnKeyRequired,
@@ -84,14 +85,10 @@ pub enum ScpCommand {
     ReqGenerateKey,
     AckGenerateKey,
     KeyShare,
-
+    /// Share the Preferences
+    PreferencesShare,
+    Ready,
     SimpleMessage,
-
-    VideoStreamConnect,
-    AudioStreamConnect,
-
-    VideoStreamStop,
-    AudioStreamStop,
 
     End,
 }
@@ -99,16 +96,14 @@ pub enum ScpCommand {
 impl ScpCommand {
     pub fn requires_body(&self) -> bool {
         match self {
-            ScpCommand::Start => false,
+            ScpCommand::Start => true,
             ScpCommand::OwnKeyRequired => false,
             ScpCommand::ReqGenerateKey => false,
             ScpCommand::AckGenerateKey => false,
             ScpCommand::KeyShare => true,
             ScpCommand::SimpleMessage => true,
-            ScpCommand::VideoStreamConnect => false,
-            ScpCommand::AudioStreamConnect => false,
-            ScpCommand::VideoStreamStop => false,
-            ScpCommand::AudioStreamStop => false,
+            ScpCommand::PreferencesShare => true,
+            ScpCommand::Ready => false,
             ScpCommand::End => false,
         }
     }
