@@ -24,16 +24,16 @@
 //! client.end_connection();
 //!
 //! ```
-use core::panic;
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Weak;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::scp_listener::ScpListener;
 
 /// Events used by the client to signify what happens inside the thread with the socket
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Connection established. Sockets should be ready to receive data and transmit data
     ConnectionEstablished(SessionConfig),
@@ -151,6 +151,7 @@ pub struct ScpClient {
     preferences: Preferences,
     tx: ActionConnector,
     rx: EventConnector,
+    sock_addr: SocketAddr,
 }
 
 impl ScpClient {
@@ -163,12 +164,13 @@ impl ScpClient {
     /// # Panics
     /// Panics when a listener cannot be created on the given TCP port.
     fn with_preferences(preferences: Preferences) -> Self {
-        let (tx, rx) = Self::spawn_handler_thread(preferences);
+        let (tx, rx, sock_addr) = Self::spawn_handler_thread(preferences);
 
         Self {
             preferences,
             tx,
             rx,
+            sock_addr,
         }
     }
     /// Spawns the event loop with TCP socket, reading the messages and responding to external events.
@@ -179,7 +181,9 @@ impl ScpClient {
     /// Messages might be missed, but the events and data flow is structured good enough to get some context,
     /// if any part keeps some state about what's happening.
     /// More importantly, it gives "async-ish" felling
-    fn spawn_handler_thread(preferences: Preferences) -> (ActionConnector, EventConnector) {
+    fn spawn_handler_thread(
+        preferences: Preferences,
+    ) -> (ActionConnector, EventConnector, SocketAddr) {
         let action: ActionConnector = Arc::new((Mutex::new(None), Condvar::new()));
         let event: EventConnector = Arc::new((Mutex::new(None), Condvar::new()));
 
@@ -187,17 +191,19 @@ impl ScpClient {
         let tx = Arc::clone(&event);
 
         let mut listener = ScpListener::new(rx, tx, preferences);
-        std::thread::spawn(move || loop {
+        let sock_addr = listener.tcp_listener.local_addr().unwrap();
+        std::thread::spawn(move || 'outer: loop {
             match listener.handle_event_loop() {
                 Ok(()) => continue,
                 Err(e) => {
                     println!("{e}");
-                    break;
+
+                    break 'outer;
                 }
             }
         });
 
-        (action, event)
+        (action, event, sock_addr)
     }
 
     pub fn request_chat(
@@ -208,7 +214,7 @@ impl ScpClient {
             destination,
             password: None,
         }));
-        self.tx.1.notify_one();
+        self.tx.1.notify_all();
 
         let (lock, cvar) = &*self.rx;
         let msg = cvar
@@ -224,20 +230,17 @@ impl ScpClient {
             _ => Err(ScpConnectionError::NotResponding),
         }
     }
-    pub fn has_incoming_connections(&mut self) -> Option<IpAddr> {
-        dbg!("Waiting for Incoming!,");
-
-        if let Some(ConnectionEvent::ConnectionIncoming(addr)) = &*self.rx.0.lock().unwrap() {
-            return Some(*addr);
+    /// Read the events in a blocking way
+    pub fn events(&self) -> impl Iterator<Item = ConnectionEvent> {
+        EventIterator {
+            rx: Arc::downgrade(&self.rx),
         }
-
-        None
     }
     /// Blocking function. If no incoming connections, it will wait until there's one available.
     pub fn accept_incoming_connection(&mut self) -> Result<SessionConfig, ScpConnectionError> {
         const TIMEOUT: Duration = std::time::Duration::from_secs(3);
         *self.tx.0.lock().unwrap() = Some(ConnectionAction::AcceptConnection);
-        self.tx.1.notify_one();
+        self.tx.1.notify_all();
         let (lock, cvar) = &*self.rx;
         let _ = cvar.wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |event| event.is_none());
         let val = &*lock.lock().unwrap();
@@ -261,7 +264,37 @@ impl Drop for ScpClient {
         let _ = self;
     }
 }
+struct EventIterator {
+    rx: Weak<(Mutex<Option<ConnectionEvent>>, Condvar)>,
+}
 
+impl Iterator for EventIterator {
+    type Item = ConnectionEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Try to upgrade the Weak reference to Arc.
+
+        // Lock and wait for a new event, as long as the message is None.
+        let msg: Option<ConnectionEvent> = loop {
+            let rx = self.rx.upgrade()?;
+            let (lock, cvar) = &*rx;
+            let msg =
+                cvar.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(1), |msg| {
+                    msg.is_none()
+                });
+            let res = match msg {
+                Ok(v) if v.1.timed_out() => continue,
+                Ok(v) => v.0.clone(),
+
+                Err(_) => None,
+            };
+            break res;
+        };
+
+        // Clone the message and take it
+        msg
+    }
+}
 /// Convinient builder for ScpClient with preferences
 pub struct ScpClientBuilder {
     preferences: Preferences,
@@ -323,35 +356,73 @@ impl ScpClientBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use std::time::Duration;
 
-    use crate::misc::get_local_ip;
-
-    use super::{ScpClient, ScpClientBuilder};
-
+    use super::{ConnectionEvent, ScpClient, ScpClientBuilder};
     fn prepare_two_clients() -> (ScpClient, ScpClient) {
         let client = ScpClientBuilder::builder()
             .audio_port(7001)
-            .port_scp(60102)
+            .port_scp(0)
             .build();
         let client2 = ScpClientBuilder::builder()
             .audio_port(7001)
-            .port_scp(60103)
+            .port_scp(0)
             .build();
         (client, client2)
     }
     #[test]
     fn test_accept() {
         let (client1, mut client2) = prepare_two_clients();
-        let ip = get_local_ip().unwrap();
 
-        let addr = SocketAddr::new(ip, 60103);
+        let addr = client2.sock_addr;
         std::thread::sleep(Duration::from_millis(100));
         let config = client1.request_chat(addr);
         std::thread::sleep(Duration::from_millis(300));
         let config2 = client2.accept_incoming_connection();
         assert!(config.is_ok());
         assert!(config2.is_ok());
+    }
+    #[test]
+    fn test_event_iterator() {
+        let (client1, mut client2) = prepare_two_clients();
+        let iterator = client1.events();
+
+        let handle = std::thread::spawn(move || {
+            for event in iterator {
+                if !matches!(event, ConnectionEvent::ConnectionEstablished(_)) {
+                    return;
+                }
+            }
+        });
+        client1.request_chat(client2.sock_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        client2.accept_incoming_connection().unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+
+        client2.end_connection();
+        drop(client1);
+        let _ = handle.join();
+    }
+    #[test]
+    fn test_iterator_timeout() {
+        let (client1, mut client2) = prepare_two_clients();
+        let iterator = client1.events();
+
+        let handle = std::thread::spawn(move || {
+            for event in iterator {
+                if !matches!(event, ConnectionEvent::ConnectionEstablished(_)) {
+                    return;
+                }
+            }
+        });
+        client1.request_chat(client2.sock_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        client2.accept_incoming_connection().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        client2.end_connection();
+        // No events for 10 secs
+        std::thread::sleep(Duration::from_millis(10000));
+        drop(client1);
+        let _ = handle.join();
     }
 }

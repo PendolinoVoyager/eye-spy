@@ -40,11 +40,15 @@ pub struct ScpListener {
     got_preferences: Option<Preferences>,
     state: ConnectionState,
     preferences: Preferences,
-    tcp_listener: TcpListener,
+    pub tcp_listener: TcpListener,
     buf: Vec<u8>,
 }
 impl ScpListener {
-    pub fn new(action: ActionConnector, event: EventConnector, preferences: Preferences) -> Self {
+    pub fn new(
+        action: ActionConnector,
+        event: EventConnector,
+        mut preferences: Preferences,
+    ) -> Self {
         let addr = misc::get_local_ip()
             .or_else(|| {
                 log::warn!("No local address found for ScpClient. Using Loopback address.");
@@ -54,6 +58,9 @@ impl ScpListener {
         let sock_addr = SocketAddr::new(addr, preferences.port_scp);
         let listener = TcpListener::bind(sock_addr)
             .unwrap_or_else(|e| panic!("Cannot bind the listener to {sock_addr}.\n{e}"));
+
+        // The OS might have given us a different port when the preferences are set to 0
+        preferences.port_scp = listener.local_addr().unwrap().port();
 
         listener.set_nonblocking(true).unwrap();
         Self {
@@ -100,14 +107,20 @@ impl ScpListener {
             }
             ConnectionAction::RefuseConnection => self.end_connection(),
             ConnectionAction::AcceptConnection => {
-                self.share_config();
-                self.finalize_connection();
+                if self.communicating_with.is_some() {
+                    self.share_config();
+                    self.finalize_connection();
+                }
             }
             ConnectionAction::SetPassword(_) => todo!(),
             ConnectionAction::UnsetPassword => todo!(),
             ConnectionAction::EndConnection => self.end_connection(),
             ConnectionAction::Terminate => {
-                return Err(anyhow::Error::msg("ScpListener terminated properly."))
+                self.end_connection();
+                *self.event.0.lock().unwrap() = None;
+
+                self.event.1.notify_one();
+                return Err(anyhow::Error::msg("ScpListener terminated properly."));
             }
         };
 
@@ -178,8 +191,8 @@ impl ScpListener {
     fn end_connection(&mut self) {
         if let Some(sock_addr) = self.communicating_with {
             if let Ok(mut stream) = TcpStream::connect(sock_addr) {
+                let _ = stream.set_nonblocking(true);
                 let _ = stream.write(&ScpMessage::new(ScpCommand::End, b"").as_bytes());
-                let _ = stream.flush();
             }
         }
     }
@@ -227,6 +240,9 @@ impl ScpListener {
             self.end_connection();
         }
     }
+
+    /// Share the if addr_in is present
+    /// Change the state to ConfigShared
     fn share_config(&mut self) {
         // share your config
         if let Some(addr_in) = self.communicating_with {

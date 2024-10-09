@@ -555,8 +555,7 @@ pub mod incoming {
             let lock = RGB_FRAME_BUFFER
                 .lock()
                 .map_err(|_| Error::msg("Mutex poisoned"))?;
-
-            Err(Error::msg("NOt implemented"))
+            todo!();
         }
 
         fn is_receiving(&self) -> bool {

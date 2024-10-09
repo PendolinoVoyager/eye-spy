@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy_tweening::lens::UiBackgroundColorLens;
 use bevy_tweening::{Animator, EaseFunction, Tween};
 
-use crate::ui_logic::{ButtonRole, ButtonWithRole};
+use crate::ui_logic::buttons::{DisconnectButton, FindHostsButton};
 use crate::STREAM_IMAGE_HANDLE;
 
 #[allow(unused)]
@@ -85,10 +85,6 @@ impl UiSpawner<'_, '_> {
         cmds.add_child(t);
         cmds
     }
-    /// Spawns a container with consistent styling and returns its Entity ID
-    pub fn spawn_pretty_container(&mut self) -> EntityCommands {
-        self.commands.spawn((get_pretty_container(), PrettyNode))
-    }
 
     pub fn spawn_pretty_text(&mut self, text: &str, font_size: f32) -> EntityCommands {
         self.commands.spawn((
@@ -121,31 +117,6 @@ fn get_pretty_button() -> ButtonBundle {
         z_index: ZIndex::Local(2),
         border_color: BorderColor(color_palette::BLACK),
         background_color: BackgroundColor(color_palette::WHITE),
-        ..Default::default()
-    }
-}
-
-/// Function to create a pretty container with predefined styling
-fn get_pretty_container() -> NodeBundle {
-    NodeBundle {
-        style: Style {
-            display: Display::Flex,
-            position_type: PositionType::Absolute,
-            width: Val::VMax(30.),
-            height: Val::VMax(50.),
-
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::FlexStart,
-            padding: UiRect::all(Val::Percent(2.)),
-            row_gap: Val::Percent(5.),
-
-            ..Default::default()
-        },
-        z_index: ZIndex::Local(1),
-        border_color: BorderColor(color_palette::WHITE),
-        border_radius: BorderRadius::all(Val::Px(10.)),
-        background_color: BackgroundColor(color_palette::DARK),
         ..Default::default()
     }
 }
@@ -286,14 +257,14 @@ fn init_ui(mut commands: Commands, mut spawner: UiSpawner) {
         let mut right_bar = p.spawn(right_side_box);
 
         let mut btn_disconnect = spawner.spawn_pretty_button_with_text("Disconnect", 32.);
-        btn_disconnect.insert(ButtonWithRole(ButtonRole::Disconnect));
+        btn_disconnect.insert(DisconnectButton);
         right_bar.add_child(stream_window);
         right_bar.add_child(btn_disconnect.id());
     });
     commands.insert_resource(containers);
     spawner
         .spawn_pretty_button_with_text("Find", 32.)
-        .insert(ButtonWithRole(ButtonRole::FindHosts));
+        .insert(FindHostsButton);
 }
 
 // struct TransformRotationLens {

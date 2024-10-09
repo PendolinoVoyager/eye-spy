@@ -3,4 +3,3 @@ A video call / streaming desktop app
 
 BACKLOG:
 
-SWITCH SCP-CLIENT TO USE TOKIO INTERNALLY 
